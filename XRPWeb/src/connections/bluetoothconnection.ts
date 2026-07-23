@@ -25,8 +25,6 @@ export class BluetoothConnection extends Connection {
     private readonly DATA_TX_CHARACTERISTIC_UUID: string = '92ae6088-f24d-4360-b1b1-a432a8ed36ff';
     private readonly DATA_RX_CHARACTERISTIC_UUID: string = '92ae6088-f24d-4360-b1b1-a432a8ed36fe';
 
-    private bleDisconnectTime: number = 0;
-
     // bluetooth data
     private bleData: Uint8Array | null = null;
     private bleDataResolveFunc: ((value: Uint8Array) => void) | null = null;
@@ -36,12 +34,24 @@ export class BluetoothConnection extends Connection {
     private readonly BLE_STOP_MSG  = "##XRPSTOP##"
     private reconnectSuccess: boolean = true;
     private readWorkerRunning: boolean = false;
+    private disconnectNotified: boolean = false;
+    private manualDisconnect: boolean = false;
+    private readonly autoReconnect: boolean;
+    private notificationReader?: BluetoothRemoteGATTCharacteristic;
+    private notificationDataReader?: BluetoothRemoteGATTCharacteristic;
+    private disconnectListenerDevice?: BluetoothDevice;
+    private suppressManagerCallback: boolean = false;
+    private disconnectGeneration: number = 0;
+    private readonly runtimeDataListeners = new Set<(data: Uint8Array) => void>();
+    private readonly runtimeDisconnectedListeners = new Set<() => void>();
+    private runtimeWriteQueue: Promise<void> = Promise.resolve();
 
     private  Table: TableMgr | undefined = undefined;
 
-    constructor(connMgr: ConnectionMgr) {
+    constructor(connMgr: ConnectionMgr, options: { autoReconnect?: boolean } = {}) {
         super();
         this.connMgr = connMgr;
+        this.autoReconnect = options.autoReconnect ?? true;
         if(this.joyStick)
             this.joyStick.writeToDevice = this.writeToDataDevice.bind(this);
         this.Table = new TableMgr();
@@ -80,7 +90,9 @@ export class BluetoothConnection extends Connection {
      */
     startBLEData() {
         // Set up the event listener for the RX characteristic
-        this.bleReader!.addEventListener('characteristicvaluechanged', (event) => {
+        if (this.bleReader && this.notificationReader !== this.bleReader) {
+            this.notificationReader = this.bleReader;
+            this.bleReader.addEventListener('characteristicvaluechanged', (event) => {
             const charEvent = event as Event & { target: BluetoothRemoteGATTCharacteristic };
             const value = charEvent.target.value;
             //if(this.DEBUG_CONSOLE_ON) this.connLogger.debug(this.TEXT_DECODER.decode(value));
@@ -99,13 +111,22 @@ export class BluetoothConnection extends Connection {
             }
             //let str = arrayBufferToString(value.buffer); // Convert ArrayBuffer to string
             //resolve(new Uint8Array(value.buffer)); // Resolve the promise with the received string
-        });
+            });
+        }
         // Optional: Reject the promise on some condition, e.g., timeout or error
 
-        if(this.bleDataReader != undefined){
-            this.bleDataReader!.addEventListener('characteristicvaluechanged', (event) => {
+        if(this.bleDataReader != undefined && this.notificationDataReader !== this.bleDataReader){
+            this.notificationDataReader = this.bleDataReader;
+            this.bleDataReader.addEventListener('characteristicvaluechanged', (event) => {
                 const charEvent = event as Event & { target: BluetoothRemoteGATTCharacteristic };
                 const value = charEvent.target.value;
+                if (!value) return;
+                const runtimeData = new Uint8Array(
+                    value.buffer,
+                    value.byteOffset,
+                    value.byteLength,
+                ).slice();
+                for (const listener of this.runtimeDataListeners) listener(runtimeData);
                 //if(this.DEBUG_CONSOLE_ON) this.connLogger.debug(this.TEXT_DECODER.decode(value));
                 if (this.ble2Data == null) {
                     this.ble2Data = new Uint8Array(value!.buffer); //just in case the resolve is not ready
@@ -181,11 +202,10 @@ export class BluetoothConnection extends Connection {
      * readWorker - this worker read data from the XRP robot
      */
     async readWorker() {
-        while (this.connectionStates === ConnectionState.Connected) {
-            this.readWorkerRunning = true;
-            this.startBLEData();
-            try {
-                while (true) {
+        this.readWorkerRunning = true;
+        this.startBLEData();
+        try {
+            while (this.connectionStates === ConnectionState.Connected) {
                     let values: Uint8Array | undefined = undefined;
                     values = await this.getBLEData();
                     this.readData(values);
@@ -203,11 +223,12 @@ export class BluetoothConnection extends Connection {
                         }
                     }
                 
-                }
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            } catch(err: any) {
-                throw new Error('read work exception: ' + err.message);
             }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        } catch(err: any) {
+            throw new Error('read work exception: ' + err.message);
+        } finally {
+            this.readWorkerRunning = false;
         }
     }
 
@@ -216,15 +237,17 @@ export class BluetoothConnection extends Connection {
      */
     private async onConnected() {
         this.connectionStates = ConnectionState.Connected;
+        this.disconnectNotified = false;
+        this.manualDisconnect = false;
         this.lastProgramRan = undefined;
-        if (this.connMgr) { 
-            this.connMgr?.connectCallback(this.connectionStates, ConnectionType.BLUETOOTH);
-        }
         if(!this.readWorkerRunning){  // if the read worker is not running then restart it  
-            this.readWorker();
+            void this.readWorker();
         }
         else{
             this.startBLEData(); // the readers may have been updated so start them again
+        }
+        if (this.connMgr && !this.suppressManagerCallback) {
+            await this.connMgr.connectCallback(this.connectionStates, ConnectionType.BLUETOOTH, this);
         }
         //await this.getToNormal();
     }
@@ -232,10 +255,26 @@ export class BluetoothConnection extends Connection {
     /**
      * onDisconnected
      */
-    private onDisconnected() {
+    private async onDisconnected() {
+        if (this.disconnectNotified) return;
+        this.disconnectNotified = true;
         this.connectionStates = ConnectionState.Disconnected;
-        if (this.connLogger) { //BUGBUG: why is this dependent on the connLogger?
-            this.connMgr?.connectCallback(this.connectionStates, ConnectionType.BLUETOOTH);
+        for (const listener of this.runtimeDisconnectedListeners) listener();
+        if (this.connLogger && !this.suppressManagerCallback) {
+            await this.connMgr?.connectCallback(this.connectionStates, ConnectionType.BLUETOOTH, this);
+        }
+    }
+
+    private async handleGATTDisconnected(): Promise<void> {
+        this.disconnectGeneration += 1;
+        this.connectionStates = ConnectionState.Disconnected;
+        await this.onDisconnected();
+        if (this.autoReconnect && !this.manualDisconnect && this.bleDevice) {
+            try {
+                await this.reconnect();
+            } catch (error) {
+                this.connLogger.debug(`BLE automatic reconnect failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
         }
     }
 
@@ -251,165 +290,139 @@ export class BluetoothConnection extends Connection {
      * @returns
      */
     public async connect(): Promise<void> {
-        this.connLogger.debug('Conneting BLE device');
-        this.bleDisconnectTime = Date.now();
+        if (!navigator.bluetooth) throw new Error('Web Bluetooth is not available in this browser.');
+        if (this.connectionStates === ConnectionState.Busy) return;
 
         this.connectionStates = ConnectionState.Busy;
-        //this.MANNUALLY_CONNECTING = true;
-
-        this.bleDevice = undefined; //just in case we were connected before.
-
-        const elapseTime = (Date.now() - (this.bleDisconnectTime)) / 1000;
-        if (elapseTime > 60) {
-            this.connLogger.debug(elapseTime);
-            //await window.alertMessage("Error while detecting bluetooth devices. \nPlease refresh the browser and try again.");
-            //TODO: Warn of need to refresh
-            return;
-        }
-
-        // Function to connect to the device
-        await navigator.bluetooth
-            .requestDevice({
-                filters: [
-                    {
-                        namePrefix: 'XRP',
-                    },
-                ],
+        this.manualDisconnect = false;
+        this.disconnectNotified = false;
+        try {
+            const device = await navigator.bluetooth.requestDevice({
+                filters: [{ namePrefix: 'XRP' }],
                 optionalServices: [this.UART_SERVICE_UUID],
-            })
-            .then(async (device) => {
-                this.connLogger.info('Connecting to device...');
-                // show a dialog that the bluetooth is connecting
-                AppMgr.getInstance().emit(EventType.EVENT_SHOWBLUETOOTH_CONNECTING, 'show-bluetooth-connecting');
-                this.bleDevice = device;
-                if (device.gatt?.connected) {
-                    console.log("Reconnecting...");
-                    await device.gatt!.disconnect();
-                }
-                return device.gatt!.connect();
-            })
-            .then((servers) => {
-                this.connLogger.info('Getting UART Service...');
-                return servers.getPrimaryService(this.UART_SERVICE_UUID);
-            })
-            .then((btService) => {
-                this.btService = btService;
-                this.connLogger.info('Getting TX Characteristic...');
-                return btService.getCharacteristic(this.TX_CHARACTERISTIC_UUID);
-            })
-            .then((characteristic) => {
-                this.connLogger.info('Connected to TX Characteristic');
-                this.bleWriter = characteristic;
-                //this.connLogger.debug('Getting RX Characteristic...');
-                return this.btService!.getCharacteristic(this.RX_CHARACTERISTIC_UUID);
-                // Now you can use the characteristic to send data
-            })
-            .then((characteristic) => {
-                this.connLogger.info('Connected to RX Characteristic');
-                this.bleReader = characteristic;
-                //this.connLogger.debug('Getting DATA_TX Characteristic...');
-                return this.btService!.getCharacteristic(this.DATA_TX_CHARACTERISTIC_UUID);
-                // Now you can use the characteristic to send data
-            })
-            .then((characteristic) => {
-                this.connLogger.info('Connected to DATA TX Characteristic');
-                this.bleDataWriter = characteristic;
-                //this.connLogger.debug('Getting DATA_TX Characteristic...');
-                return this.btService!.getCharacteristic(this.DATA_RX_CHARACTERISTIC_UUID);
-                // Now you can use the characteristic to send data
-            })
-            .then((characteristic) => {
-                this.connLogger.info('Connected to DATA RX Characteristic');
-                this.bleDataReader = characteristic;
-                //this.bleDataReader = undefined;
-                //this.READBLE.addEventListener('characteristicvaluechanged', this.readloopBLE);
-
-                this.bleReader!.startNotifications();
-                this.bleDataReader!.startNotifications();
-                this.bleDevice!.addEventListener('gattserverdisconnected', () => {
-                    this.disconnect();
-                });
-                this.onConnected();
-            })
-            .catch((error) => {
-                if (error.code === 8) {
-                    this.connLogger.info(error.message);
-                    if(error.message.includes(this.DATA_RX_CHARACTERISTIC_UUID) || error.message.includes(this.DATA_TX_CHARACTERISTIC_UUID)){
-                        //OK if data functions are not supported
-                        this.bleReader!.startNotifications();
-                        this.bleDevice!.addEventListener('gattserverdisconnected', () => {
-                            this.disconnect();
-                        });
-                        this.onConnected();
-                    }
-                    else {this.onDisconnected();}
-                } else {
-                    throw new Error('BLE connection failed' + error.message);
-                }
             });
-            
+            if (this.connMgr?.isBluetoothDeviceClaimed(device, this)) {
+                throw new Error('That XRP is already connected. Choose a different Bluetooth device.');
+            }
 
-        //this.MANNUALLY_CONNECTING = false;
-        this.connLogger.debug('Exiting BLE connect');
+            this.bleDevice = device;
+            AppMgr.getInstance().emit(EventType.EVENT_SHOWBLUETOOTH_CONNECTING, 'show-bluetooth-connecting');
+            if (device.gatt?.connected) device.gatt.disconnect();
+            if (!device.gatt) throw new Error('The selected XRP does not expose a Bluetooth GATT server.');
+            const server = await device.gatt.connect();
+            await this.discoverCharacteristics(server);
+            this.attachDisconnectListener(device);
+            this.reconnectSuccess = true;
+            await this.onConnected();
+        } catch (error) {
+            this.connectionStates = ConnectionState.Disconnected;
+            this.manualDisconnect = true;
+            if (this.bleDevice?.gatt?.connected) this.bleDevice.gatt.disconnect();
+            AppMgr.getInstance().emit(EventType.EVENT_HIDE_BLUETOOTH_CONNECTING, 'hide-bluetooth-connecting');
+            throw new Error(`BLE connection failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
     }
 
     public async disconnect(): Promise<void> {
-        this.connLogger.info('Entering BLE disconnect');
-        this.bleDisconnectTime = Date.now();
+        this.manualDisconnect = true;
+        this.connectionStates = ConnectionState.Disconnected;
+        try { await this.bleReader?.stopNotifications(); } catch { /* already stopped */ }
+        try { await this.bleDataReader?.stopNotifications(); } catch { /* optional characteristic */ }
+        if (this.bleDevice?.gatt?.connected) this.bleDevice.gatt.disconnect();
         this.bleWriter = undefined;
         this.bleReader = undefined;
-        this.connectionStates = ConnectionState.Disconnected; // Will stop certain events and break any EOT waiting functions
-        //TODO: handle UI state here???
-        // if (!this.STOP) { //If they pushed the STOP button then don't make it look disconnected it will be right back
-        //     //this.onDisconnect?.();
-        //     this.connLogger.debug("bleDisconnect - they didn't press STOP")
-        // }
-        //this.SPECIAL_FORCE_OUTPUT_FLAG = false;
-        //TODO: These are UI states - should we kept in the connection logics?
-        // this.RUN_BUSY = false;
-        // this.STOP = false;
-        this.reconnect();
+        this.bleDataWriter = undefined;
+        this.bleDataReader = undefined;
+        await this.onDisconnected();
     }
 
-    private async reconnect() {
-        this.connLogger.info('Entering reconnect');
-        if (this.connectionStates === ConnectionState.Disconnected) {
-            try {
-                const server = await this.connectWithTimeout(this.bleDevice!, 10000); //wait for 10seconds to see if it reconnects
-                //const server = await this.BLE_DEVICE.gatt.connect();
-                this.btService = await server.getPrimaryService(this.UART_SERVICE_UUID);
-                //this.connLogger.debug('Getting TX Characteristic...');
-                this.bleWriter = await this.btService.getCharacteristic(
-                    this.TX_CHARACTERISTIC_UUID,
-                );
-                this.bleReader = await this.btService.getCharacteristic(
-                    this.RX_CHARACTERISTIC_UUID,
-                );
-            
-                this.bleDataWriter = await this.btService.getCharacteristic(
-                    this.DATA_TX_CHARACTERISTIC_UUID,
-                );
-                this.bleDataReader = await this.btService.getCharacteristic(
-                    this.DATA_RX_CHARACTERISTIC_UUID,
-                );
-
-                this.bleReader.startNotifications();
-                this.bleDataReader.startNotifications();
-                await this.onConnected();
-                this.reconnectSuccess = true;
-                
-                //return true;
-                // Perform operations after successful connection
-            } catch (error) {
-                if (error instanceof Error) {
-                    this.connLogger.debug(`timed out:  ${error.stack ?? error.message}`);
-                }
-                this.bleDevice = undefined;
-                this.onDisconnected();
-                //throw new Error('Failed BLE reconnect' + error); TODO: I don't think we want to throw an error here
-            }
+    public async reconnect(): Promise<void> {
+        if (!this.bleDevice?.gatt) {
+            await this.connect();
+            return;
         }
-        this.connLogger.info('Existing reconnect');
+        if (this.isConnected()) return;
+        this.manualDisconnect = false;
+        this.disconnectNotified = false;
+        this.connectionStates = ConnectionState.Busy;
+        try {
+            const server = await this.connectWithTimeout(this.bleDevice, 10000);
+            await this.discoverCharacteristics(server);
+            this.reconnectSuccess = true;
+            await this.onConnected();
+        } catch (error) {
+            this.connectionStates = ConnectionState.Disconnected;
+            await this.onDisconnected();
+            throw error;
+        }
+    }
+
+    private async discoverCharacteristics(server: BluetoothRemoteGATTServer): Promise<void> {
+        this.btService = await server.getPrimaryService(this.UART_SERVICE_UUID);
+        this.bleWriter = await this.btService.getCharacteristic(this.TX_CHARACTERISTIC_UUID);
+        this.bleReader = await this.btService.getCharacteristic(this.RX_CHARACTERISTIC_UUID);
+        this.bleDataWriter = undefined;
+        this.bleDataReader = undefined;
+        try {
+            this.bleDataWriter = await this.btService.getCharacteristic(this.DATA_TX_CHARACTERISTIC_UUID);
+            this.bleDataReader = await this.btService.getCharacteristic(this.DATA_RX_CHARACTERISTIC_UUID);
+        } catch {
+            this.connLogger.info('Optional XRP DATA characteristics are not available; IDE UART remains enabled.');
+        }
+        await this.bleReader.startNotifications();
+        if (this.bleDataReader) await this.bleDataReader.startNotifications();
+    }
+
+    private attachDisconnectListener(device: BluetoothDevice): void {
+        if (this.disconnectListenerDevice === device) return;
+        this.disconnectListenerDevice = device;
+        device.addEventListener('gattserverdisconnected', () => {
+            void this.handleGATTDisconnected();
+        });
+    }
+
+    public getDevice(): BluetoothDevice | undefined {
+        return this.bleDevice;
+    }
+
+    public getDeviceName(): string | undefined {
+        return this.bleDevice?.name;
+    }
+
+    public getBrowserDeviceId(): string | undefined {
+        return this.bleDevice?.id;
+    }
+
+    public hasRuntimeDataChannel(): boolean {
+        return this.bleDataReader !== undefined && this.bleDataWriter !== undefined;
+    }
+
+    public onRuntimeData(listener: (data: Uint8Array) => void): () => void {
+        this.runtimeDataListeners.add(listener);
+        return () => this.runtimeDataListeners.delete(listener);
+    }
+
+    public onRuntimeDisconnected(listener: () => void): () => void {
+        this.runtimeDisconnectedListeners.add(listener);
+        return () => this.runtimeDisconnectedListeners.delete(listener);
+    }
+
+    public async writeRuntimeData(data: Uint8Array): Promise<void> {
+        if (!this.isConnected() || !this.bleDataWriter) {
+            throw new Error('The XRP Bluetooth DATA channel is not connected.');
+        }
+        this.runtimeWriteQueue = this.runtimeWriteQueue.then(async () => {
+            if (!this.bleDataWriter) throw new Error('The XRP Bluetooth DATA writer is unavailable.');
+            if (
+                this.bleDataWriter.properties.writeWithoutResponse &&
+                typeof this.bleDataWriter.writeValueWithoutResponse === 'function'
+            ) {
+                await this.bleDataWriter.writeValueWithoutResponse(data as BufferSource);
+            } else {
+                await this.bleDataWriter.writeValue(data as BufferSource);
+            }
+        });
+        await this.runtimeWriteQueue;
     }
 
     private str2ab(str: string): ArrayBuffer {
@@ -447,9 +460,7 @@ export class BluetoothConnection extends Connection {
         this.connLogger.debug('writeToDataDevice BLE: ' + data);
 
         try {
-            //this.connLogger.debug("writing: " + this.TEXT_DECODER.decode(str));
-            await this.bleDataWriter?.writeValue(data as BufferSource);
-            
+            await this.writeRuntimeData(data);
         } catch (error) {
             this.connLogger.debug(error);
         }
@@ -470,6 +481,7 @@ export class BluetoothConnection extends Connection {
                 console.error('ble write failed:', error);
             }
         });
+        await this.Queue;
     }
 
     public async getToREPL():Promise<boolean>{
@@ -485,7 +497,21 @@ export class BluetoothConnection extends Connection {
         }
         // Need to send BLE_STOP_MSG, this causes the XRP to reboot so we need to wait for reconnect to complete
         this.reconnectSuccess = false;
-        await this.writeToDevice(this.BLE_STOP_MSG);
-        return true;
+        this.suppressManagerCallback = true;
+        const startingDisconnectGeneration = this.disconnectGeneration;
+        try {
+            await this.writeToDevice(this.BLE_STOP_MSG);
+            const deadline = Date.now() + 15000;
+            while (Date.now() < deadline) {
+                if (this.disconnectGeneration > startingDisconnectGeneration &&
+                    this.connectionStates === ConnectionState.Connected) {
+                    return true;
+                }
+                await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+            return false;
+        } finally {
+            this.suppressManagerCallback = false;
+        }
     }
 }

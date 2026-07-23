@@ -15,6 +15,7 @@ import RobotChatWidget from "./sensors/RobotChatWidget";
 import CustomEmotionKeywordsWidget from "./sensors/CustomEmotionKeywordsWidget";
 import CustomXPPSensor from "./sensors/CustomXPPSensor";
 import CustomVariableWidget from "./sensors/CustomVariableWidget";
+import MultiAgentLabWidget from "./sensors/MultiAgentLabWidget";
 import { getCustomSensor } from "./sensors/customRegistry";
 import { GridStackOptions } from "gridstack";
 import AddWidgets from "./AddWidget";
@@ -55,6 +56,7 @@ const COMPONENT_MAP = {
   UserProfileMemoryWidget: () => <UserProfileMemoryWidget />,
   RobotChatWidget: () => <RobotChatWidget />,
   CustomEmotionKeywordsWidget: () => <CustomEmotionKeywordsWidget />,
+  MultiAgentLabWidget: () => <MultiAgentLabWidget />,
   CustomSensor: ({ sensorName }: { sensorName: string }) => {
     const def = getCustomSensor(sensorName);
     if (!def) {

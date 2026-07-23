@@ -1,0 +1,57 @@
+try:
+    from micropython import const
+except ImportError:
+    def const(value):
+        return value
+
+XPP_START = b"\xAA\x55"
+XPP_END = b"\x55\xAA"
+XPP_MULTI_AGENT = const(0x30)
+
+PROTOCOL_VERSION = const(1)
+HEADER_LENGTH = const(14)
+MAX_APPLICATION_PAYLOAD = const(220)
+MAX_XPP_PAYLOAD = const(255)
+MAX_RECEIVE_BUFFER = const(4096)
+
+KIND_HELLO = const(0x01)
+KIND_HELLO_ACK = const(0x02)
+KIND_HEARTBEAT = const(0x03)
+KIND_DATA = const(0x10)
+KIND_ACK = const(0x11)
+KIND_ERROR = const(0x12)
+KIND_PING = const(0x20)
+KIND_PONG = const(0x21)
+
+KNOWN_KINDS = (
+    KIND_HELLO,
+    KIND_HELLO_ACK,
+    KIND_HEARTBEAT,
+    KIND_DATA,
+    KIND_ACK,
+    KIND_ERROR,
+    KIND_PING,
+    KIND_PONG,
+)
+
+FLAG_ACK_REQUIRED = const(0x01)
+FLAG_LATEST_ONLY = const(0x02)
+FLAG_HIGH_PRIORITY = const(0x04)
+FLAG_RELAYED = const(0x08)
+
+COORDINATOR_ID = const(0)
+MIN_ROBOT_ID = const(1)
+MAX_ROBOT_ID = const(65533)
+UNASSIGNED_ROBOT_ID = const(65534)
+BROADCAST_ROBOT_ID = const(65535)
+
+TOPIC_SYSTEM_TEST = const(0x0001)
+TOPIC_ROBOT_STATUS = const(0x0002)
+TOPIC_TEAM_DIRECTORY = const(0x0003)
+TOPIC_EMERGENCY_STOP = const(0x0100)
+TOPIC_DRIVE_VELOCITY = const(0x0101)
+TOPIC_ROBOT_POSE = const(0x0102)
+TOPIC_BALL_STATE = const(0x0103)
+TOPIC_EMOTION_STATE = const(0x0201)
+TOPIC_USER_DEFINED_BASE = const(0x8000)
+TOPIC_EDUCATIONAL_DATA = const(0x8000)

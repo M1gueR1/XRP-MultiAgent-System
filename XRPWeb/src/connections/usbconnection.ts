@@ -4,6 +4,7 @@ import i18n from '@/utils/i18n';
 import { ConnectionType } from '@/utils/types';
 import Connection, { ConnectionState } from '@connections/connection';
 import TableMgr from '@/managers/tablemgr';
+import { encodeUSBTeamFrame, USBTeamFrameParser } from '@/multiagent/transport/USBSerialTeamFraming';
 
 /**
  * USB Connection - establish USB serial connection to the XRP Robot
@@ -14,6 +15,13 @@ export class USBConnection extends Connection {
     private reader: ReadableStreamDefaultReader<Uint8Array> | undefined = undefined; // Reference to serial port reader, only one can be locked at a time
     private writer: WritableStreamDefaultWriter<Uint8Array> | undefined = undefined; // Reference to serial port writer, only one can be locked at a time
     private Table: TableMgr | undefined = undefined;
+    private readonly manualOnly: boolean;
+    private readonly listenForDeviceEvents: boolean;
+    private readonly runtimeDataListeners = new Set<(data: Uint8Array) => void>();
+    private readonly runtimeDisconnectedListeners = new Set<() => void>();
+    private runtimeWriteQueue: Promise<void> = Promise.resolve();
+    private readonly XPP_MULTI_AGENT = 0x30;
+    private readonly runtimeFrameParser = new USBTeamFrameParser();
 
     // Define USB connection constants
     readonly USB_VENDOR_ID_BETA: number = 11914; // For filtering ports during auto or manual selection
@@ -23,9 +31,14 @@ export class USBConnection extends Connection {
     readonly USB_PRODUCT_ID: number = 70; // For filtering ports during auto or manual selection
     readonly USB_PRODUCT_ID_NANOXRP: number = 0x110A; // For filtering ports during auto or manual selection
 
-    constructor(connMgr: ConnectionMgr) {
+    constructor(
+        connMgr: ConnectionMgr,
+        options: { manualOnly?: boolean; listenForDeviceEvents?: boolean } = {},
+    ) {
         super();
         this.connMgr = connMgr;
+        this.manualOnly = options.manualOnly ?? false;
+        this.listenForDeviceEvents = options.listenForDeviceEvents ?? true;
         this.isManualConnection = false;
         this.Table = new TableMgr();
         if(this.joyStick)
@@ -33,13 +46,13 @@ export class USBConnection extends Connection {
 
         // setup USB connection listeners
         // Check if browser can use WebSerial
-        if ('serial' in navigator) {
+        if ('serial' in navigator && this.listenForDeviceEvents) {
             this.connLogger.debug('This browser supports serial port');
             // Attempt auto-connect when page validated device plugged in, do not start manual selection menu
             navigator.serial.addEventListener('connect', () => {
                 this.connLogger.debug('USB Connection: detected connect event');
-                if (this.isManualConnection == false) {
-                    this.tryAutoConnect();
+                if (!this.manualOnly && !this.isManualConnection && !this.isConnected()) {
+                    void this.tryAutoConnect();
                 }
             });
 
@@ -49,15 +62,12 @@ export class USBConnection extends Connection {
 
                 // Only display disconnect message if there is a matching port on auto detect or not already disconnected
                 if (
-                    this.checkPortMatching(disconnectedPort) &&
+                    disconnectedPort === this.port &&
                     this.connectionStates !== ConnectionState.Disconnected
                 ) {
                     this.connLogger.debug('User unplugged XRP USB connection cable');
-                    this.writer = undefined;
-                    this.reader = undefined;
-                    this.port = undefined;
                     this.connectionStates = ConnectionState.Disconnected;
-                    this.onDisconnected();
+                    void this.onDisconnected();
                 }
             });
         } else {
@@ -98,12 +108,21 @@ export class USBConnection extends Connection {
                         
                         // Process complete XPP packets
                         for (const packet of packets) {
-                            this.processXPPPacket(packet, this.Table);
+                            if (packet[2] === this.XPP_MULTI_AGENT) {
+                                for (const listener of this.runtimeDataListeners) listener(packet);
+                            } else {
+                                this.processXPPPacket(packet, this.Table);
+                            }
                         }
                         
-                        // Pass any regular (non-XPP) data to readData for normal processing
-                        if (regularData.length > 0) {
-                            this.readData(regularData);
+                        const serialFrames = this.runtimeFrameParser.push(regularData);
+                        for (const packet of serialFrames.packets) {
+                            for (const listener of this.runtimeDataListeners) listener(packet);
+                        }
+
+                        // Pass ordinary terminal data through after removing team frames.
+                        if (serialFrames.regularData.length > 0) {
+                            this.readData(serialFrames.regularData);
                         }
                     }
                 }
@@ -150,20 +169,20 @@ export class USBConnection extends Connection {
         const ports = await navigator.serial.getPorts();
         if (Array.isArray(ports)) {
             for (let ip = 0; ip < ports.length; ip++) {
-                if (this.checkPortMatching(ports[ip])) {
+                if (this.checkPortMatching(ports[ip]) && !this.connMgr?.isUSBPortClaimed(ports[ip], this)) {
                     this.port = ports[ip];
                     if (await this.openPort()) {
-                        this.onConnected();
+                        await this.onConnected();
                         this.connectionStates = ConnectionState.Connected;
                         return true;
                     }
                 }
             }
         } else {
-            if (this.checkPortMatching(ports)) {
+            if (this.checkPortMatching(ports) && !this.connMgr?.isUSBPortClaimed(ports, this)) {
                 this.port = ports;
                 if (await this.openPort()) {
-                    this.onConnected();
+                    await this.onConnected();
                     this.connectionStates = ConnectionState.Connected;
                 }
                 return true;
@@ -172,7 +191,7 @@ export class USBConnection extends Connection {
 
         //document.getElementById('IDConnectBTN')!.style.display = "block";
         //TODO: report error
-        this.connectionStates = ConnectionState.Connected;
+        this.connectionStates = ConnectionState.Disconnected;
 
         this.connLogger.debug('Existing tryAutoConnect');
         return false;
@@ -212,10 +231,10 @@ export class USBConnection extends Connection {
     private async onConnected() {
         this.connectionStates = ConnectionState.Connected;
         if (this.port) this.writer = this.port.writable?.getWriter();
+        void this.readWorker();
         if (this.connMgr) {
-            this.connMgr.connectCallback(this.connectionStates, ConnectionType.USB);
+            await this.connMgr.connectCallback(this.connectionStates, ConnectionType.USB, this);
         }
-        this.readWorker();
         //await this.getToNormal();
         this.lastProgramRan = undefined;
     }
@@ -223,25 +242,37 @@ export class USBConnection extends Connection {
     /**
      * onDisconnected
      */
-    private onDisconnected() {
+    private async onDisconnected() {
         this.connLogger.debug('USB connection is lost');
         if(this.port != undefined){
             //this.disconnect = true;
             if(this.reader != undefined){
-                this.reader.cancel();
-                this.reader.releaseLock();
+                try {
+                    await this.reader.cancel();
+                    this.reader.releaseLock();
+                } catch {
+                    this.connLogger.debug('USB reader was already released after device removal.');
+                }
             }
             if(this.writer != undefined){
-                this.writer.releaseLock();
+                try {
+                    this.writer.releaseLock();
+                } catch {
+                    this.connLogger.debug('USB writer was already released after device removal.');
+                }
             }
-            this.port.close();
+            try {
+                await this.port.close();
+            } catch {
+                this.connLogger.debug('USB port was already closed after device removal.');
+            }
 
             this.reader = undefined;
-            this.reader = undefined;
-            this.port = undefined;
+            this.writer = undefined;
         }
         this.connectionStates = ConnectionState.Disconnected;
-        this.connMgr?.connectCallback(this.connectionStates, ConnectionType.USB);
+        for (const listener of this.runtimeDisconnectedListeners) listener();
+        await this.connMgr?.connectCallback(this.connectionStates, ConnectionType.USB, this);
     }
 
     
@@ -271,7 +302,7 @@ export class USBConnection extends Connection {
             return;
         }
 
-        const autoConnected = await this.tryAutoConnect();
+        const autoConnected = this.manualOnly ? false : await this.tryAutoConnect();
 
         const filters = [
             { usbVendorId: this.USB_VENDOR_ID_BETA, usbProductId: this.USB_PRODUCT_ID_BETA },
@@ -287,10 +318,13 @@ export class USBConnection extends Connection {
             await navigator.serial
                 .requestPort({ filters })
                 .then(async (port) => {
+                    if (this.connMgr?.isUSBPortClaimed(port, this)) {
+                        throw new Error('That XRP is already connected. Choose a different USB port.');
+                    }
                     this.port = port;
                     this.connLogger.debug('Manually connected!');
                     if (await this.openPort()) {
-                        this.onConnected();
+                        await this.onConnected();
                     } else {
                         this.connLogger.debug('Connection FAILED. Check cable and try again');
                         //TODO: How report failure
@@ -306,7 +340,9 @@ export class USBConnection extends Connection {
                     //TODO: Report error
                 });
             this.isManualConnection = false;
-            this.connectionStates = ConnectionState.Connected;
+            if (!this.isConnected()) {
+                this.connectionStates = ConnectionState.Disconnected;
+            }
         }
 
         this.connLogger.debug('Existing connect');
@@ -331,7 +367,7 @@ export class USBConnection extends Connection {
         if (this.reader != undefined) {
             try {
                 await this.reader.cancel();
-            } catch (error) {
+            } catch {
                 this.connLogger.debug(
                     'USB reader cancel failed or was already cancelled.',
                 );
@@ -339,7 +375,7 @@ export class USBConnection extends Connection {
 
             try {
                 this.reader.releaseLock();
-            } catch (error) {
+            } catch {
                 this.connLogger.debug(
                     'USB reader lock was already released.',
                 );
@@ -351,7 +387,7 @@ export class USBConnection extends Connection {
         if (this.writer != undefined) {
             try {
                 this.writer.releaseLock();
-            } catch (error) {
+            } catch {
                 this.connLogger.debug(
                     'USB writer lock was already released.',
                 );
@@ -363,23 +399,75 @@ export class USBConnection extends Connection {
         if (this.port != undefined) {
             try {
                 await this.port.close();
-            } catch (error) {
+            } catch {
                 this.connLogger.debug(
                     'USB port close failed or was already closed.',
                 );
             }
 
-            this.port = undefined;
         }
 
         this.connLogger.debug(
             'USB connection fully closed.',
         );
 
-        this.connMgr?.connectCallback(
+        for (const listener of this.runtimeDisconnectedListeners) listener();
+
+        await this.connMgr?.connectCallback(
             this.connectionStates,
             ConnectionType.USB,
+            this,
         );
+    }
+
+    /** Reopen this connection's already-authorized serial port. */
+    public async reconnect(): Promise<void> {
+        if (!this.port) {
+            await this.connect();
+            return;
+        }
+        if (this.isConnected()) return;
+        this.connectionStates = ConnectionState.Busy;
+        if (await this.openPort()) {
+            await this.onConnected();
+        } else {
+            this.connectionStates = ConnectionState.Disconnected;
+        }
+    }
+
+    public getPortInfo(): SerialPortInfo | undefined {
+        return this.port?.getInfo();
+    }
+
+    public getPortHandle(): SerialPort | undefined {
+        return this.port;
+    }
+
+    public hasRuntimeDataChannel(): boolean {
+        return this.isConnected() && this.writer !== undefined;
+    }
+
+    public onRuntimeData(listener: (data: Uint8Array) => void): () => void {
+        this.runtimeDataListeners.add(listener);
+        return () => this.runtimeDataListeners.delete(listener);
+    }
+
+    public onRuntimeDisconnected(listener: () => void): () => void {
+        this.runtimeDisconnectedListeners.add(listener);
+        return () => this.runtimeDisconnectedListeners.delete(listener);
+    }
+
+    public async writeRuntimeData(data: Uint8Array): Promise<void> {
+        if (!this.hasRuntimeDataChannel()) {
+            throw new Error('The XRP USB serial channel is not connected.');
+        }
+        this.runtimeWriteQueue = this.runtimeWriteQueue.then(async () => {
+            if (!this.writer) throw new Error('The XRP USB serial writer is unavailable.');
+            const framed = encodeUSBTeamFrame(data);
+            await this.writer.ready;
+            await this.writer.write(framed);
+        });
+        await this.runtimeWriteQueue;
     }
 
     /**

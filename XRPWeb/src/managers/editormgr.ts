@@ -26,6 +26,8 @@ export type EditorSession = {
     content?: string;
     workspace?: Workspace;
     lastUpdated?: Date;
+    robotSessionId?: string | null;
+    multiRobotSessionIds?: string[];
 };
 
 /**
@@ -36,6 +38,7 @@ export type EditorSession = {
 export type EdSearchParams = {
     name: string;
     path: string;
+    robotSessionId?: string | null;
 };
 
 /**
@@ -158,7 +161,7 @@ export default class EditorMgr {
      */
     public RemoveEditorByName(searchParams: EdSearchParams): string | undefined{
         for (const session of this.editorSessions.values()) {
-            if (session.name === searchParams.name && session.path === searchParams.path) {
+            if (this.matchesSearch(session, searchParams)) {
                 return this.RemoveEditor(session.id);
             }
         };
@@ -172,7 +175,7 @@ export default class EditorMgr {
      */
     public RemoveEditorTabByName(searchParams: EdSearchParams) {
         for (const session of this.editorSessions.values()) {
-            if (session.name === searchParams.name && session.path === searchParams.path) {
+            if (this.matchesSearch(session, searchParams)) {
                 return this.RemoveEditorTab(session.id);
             }
         };
@@ -185,7 +188,7 @@ export default class EditorMgr {
      */
     public SelectEditorTabByName(searchParams: EdSearchParams) {
         for (const session of this.editorSessions.values()) {
-            if (session.name === searchParams.name && session.path === searchParams.path) {
+            if (this.matchesSearch(session, searchParams)) {
                 return this.SelectEditorTab(session.id);
             }
         };
@@ -252,7 +255,7 @@ export default class EditorMgr {
      */
     public getEditorSessionByName(searchParams: EdSearchParams): EditorSession | undefined {
         for (const session of this.editorSessions.values()) {
-            if (session.name === searchParams.name && session.path === searchParams.path) {
+            if (this.matchesSearch(session, searchParams)) {
                 return session;
             }
         }
@@ -275,7 +278,7 @@ export default class EditorMgr {
      */
     public hasEditorSessionByName(searchParams: EdSearchParams): boolean {
         for (const session of this.editorSessions.values()) {
-            if (session.name === searchParams.name && session.path === searchParams.path) {
+            if (this.matchesSearch(session, searchParams)) {
                 return true;
             }
         }
@@ -342,6 +345,14 @@ export default class EditorMgr {
     public async saveEditor(id: string, code: string) {
         const session = this.editorSessions.get(id);
         if (session) {
+            if (session.multiRobotSessionIds?.length) {
+                session.content = code;
+                AppMgr.getInstance().emit(
+                    EventType.EVENT_MULTI_ROBOT_SAVE_REQUEST,
+                    JSON.stringify({ editorId: id, code }),
+                );
+                return;
+            }
             const isConnected = AppMgr.getInstance().getConnection()?.isConnected() ?? false;
             if (!isConnected && !AppMgr.getInstance().authService.isLogin) {
                 // show a dialog to inform user to connect to XRP or login to Google Drive
@@ -350,6 +361,13 @@ export default class EditorMgr {
             }
 
             if (isConnected) {
+                if (!this.targetsActiveRobot(session)) {
+                    AppMgr.getInstance().emit(
+                        EventType.EVENT_ALERT,
+                        'This tab belongs to another XRP. Select that robot in Multi-Agent Lab before saving.',
+                    );
+                    return;
+                }
                 // save the session to XRP
                 AppMgr.getInstance().emit(EventType.EVENT_SHOWPROGRESS, Constants.SHOW_PROGRESS);
                 await CommandToXRPMgr.getInstance().uploadFile(session.path, code, true).then(() =>{
@@ -497,7 +515,7 @@ export default class EditorMgr {
         // Get all unsaved editor sessions
         const unsavedSessions: Array<{ id: string; session: EditorSession }> = [];
         this.editorSessions.forEach((session, id) => {
-            if (session.isModified) {
+            if (session.isModified && !session.multiRobotSessionIds?.length && this.targetsActiveRobot(session)) {
                 unsavedSessions.push({ id, session });
             }
         });
@@ -592,6 +610,14 @@ export default class EditorMgr {
             return;
         }
 
+        if (!this.targetsActiveRobot(session)) {
+            AppMgr.getInstance().emit(
+                EventType.EVENT_ALERT,
+                'This tab belongs to another XRP. Select that robot in Multi-Agent Lab first.',
+            );
+            return;
+        }
+
         const isConnected = AppMgr.getInstance().getConnection()?.isConnected() ?? false;
         if (!isConnected) {
             return; // Can't save if not connected
@@ -677,5 +703,17 @@ export default class EditorMgr {
             AppMgr.getInstance().emit(EventType.EVENT_UPLOAD_DONE, '');
             throw error;
         }
+    }
+
+    public targetsActiveRobot(session: EditorSession): boolean {
+        if (session.multiRobotSessionIds?.length) return true;
+        if (!session.robotSessionId) return true;
+        return session.robotSessionId === AppMgr.getInstance().getActiveRobotSessionId();
+    }
+
+    private matchesSearch(session: EditorSession, searchParams: EdSearchParams): boolean {
+        return session.name === searchParams.name &&
+            session.path === searchParams.path &&
+            (searchParams.robotSessionId === undefined || session.robotSessionId === searchParams.robotSessionId);
     }
 }

@@ -2466,3 +2466,318 @@ Blockly.Blocks["xrp_voice_clear"] = {
     this.setHelpUrl("");
   },
 };
+
+// ---------------------------------------------------------
+// Multi-XRP team communication
+// ---------------------------------------------------------
+
+const XRP_TEAM_MESSAGE_MODES = [
+  ["latest sensor value", "LATEST"],
+  ["important event", "EVENT"],
+];
+const XRP_TEAM_BLOCK_COLOUR = "#f2b705";
+
+Blockly.Blocks["xrp_team_start"] = {
+  init: function () {
+    this.appendDummyInput().appendField("start XRP communication");
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Start team messaging and wait until this XRP is connected to the laptop coordinator.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_broadcast"] = {
+  init: function () {
+    this.appendValueInput("VALUE")
+      .setCheck(null)
+      .appendField("broadcast");
+    this.appendDummyInput()
+      .appendField("on channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("as")
+      .appendField(new Blockly.FieldDropdown(XRP_TEAM_MESSAGE_MODES), "MODE");
+    this.setInputsInline(true);
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Send a typed value to every other XRP through the laptop coordinator.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_send"] = {
+  init: function () {
+    this.appendValueInput("VALUE")
+      .setCheck(null)
+      .appendField("send");
+    this.appendValueInput("TARGET")
+      .setCheck(["String", "Number"])
+      .appendField("on channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("to robot");
+    this.appendDummyInput()
+      .appendField("as")
+      .appendField(new Blockly.FieldDropdown(XRP_TEAM_MESSAGE_MODES), "MODE");
+    this.setInputsInline(true);
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Send a typed value to one XRP using its alias or numeric team ID.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_send_to_name"] = {
+  init: function () {
+    this.appendValueInput("VALUE")
+      .setCheck(null)
+      .appendField("send");
+    this.appendValueInput("TARGET")
+      .setCheck("String")
+      .appendField("on channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("to robot name");
+    this.appendDummyInput()
+      .appendField("as")
+      .appendField(new Blockly.FieldDropdown(XRP_TEAM_MESSAGE_MODES), "MODE");
+    this.setInputsInline(true);
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Send a typed value to one XRP using the name shown in the team widget.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_send_to_id"] = {
+  init: function () {
+    this.appendValueInput("VALUE")
+      .setCheck(null)
+      .appendField("send");
+    this.appendValueInput("TARGET")
+      .setCheck("Number")
+      .appendField("on channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("to robot ID");
+    this.appendDummyInput()
+      .appendField("as")
+      .appendField(new Blockly.FieldDropdown(XRP_TEAM_MESSAGE_MODES), "MODE");
+    this.setInputsInline(true);
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Send a typed value to one XRP using its numeric team ID.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_has_message"] = {
+  init: function () {
+    this.appendDummyInput()
+      .appendField("is new message on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("?");
+    this.setOutput(true, "Boolean");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("True once for each new value received on this channel.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_read"] = {
+  init: function () {
+    this.appendDummyInput()
+      .appendField("latest team value on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL");
+    this.setOutput(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read the latest typed value and mark it as consumed.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_has_message_from"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck(["String", "Number"])
+      .appendField("is new message on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot")
+      .appendField("?");
+    this.setOutput(true, "Boolean");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Check for a new value from one specific XRP alias or team ID.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_has_message_from_name"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck("String")
+      .appendField("is new message on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot name")
+      .appendField("?");
+    this.setOutput(true, "Boolean");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Check for a new value from one specific XRP name.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_has_message_from_id"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck("Number")
+      .appendField("is new message on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot ID")
+      .appendField("?");
+    this.setOutput(true, "Boolean");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Check for a new value from one specific XRP team ID.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_read_from"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck(["String", "Number"])
+      .appendField("latest team value on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot");
+    this.setOutput(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read the latest value from one specific XRP without mixing multiple senders.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_read_from_name"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck("String")
+      .appendField("latest team value on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot name");
+    this.setOutput(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read the latest value from one specific XRP name.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_read_from_id"] = {
+  init: function () {
+    this.appendValueInput("SOURCE")
+      .setCheck("Number")
+      .appendField("latest team value on")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL")
+      .appendField("from robot ID");
+    this.setOutput(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read the latest value from one specific XRP team ID.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_sender"] = {
+  init: function () {
+    this.appendDummyInput()
+      .appendField("sender robot ID of channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL");
+    this.setOutput(true, "Number");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Get the team ID that sent the latest value on this channel.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_sender_name"] = {
+  init: function () {
+    this.appendDummyInput()
+      .appendField("sender robot name of channel")
+      .appendField(new Blockly.FieldTextInput("distance"), "CHANNEL");
+    this.setOutput(true, "String");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Get the robot name that sent the latest value on this channel.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_my_id"] = {
+  init: function () {
+    this.appendDummyInput().appendField("this IDE XRP robot ID");
+    this.setOutput(true, "Number");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("The team ID assigned to the XRP currently running this IDE program.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_ready"] = {
+  init: function () {
+    this.appendDummyInput().appendField("is team communication ready?");
+    this.setOutput(true, "Boolean");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Checks the Bluetooth message channel and handshake state.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_dashboard_emotion"] = {
+  init: function () {
+    this.appendDummyInput().appendField("latest dashboard emotion ID");
+    this.setOutput(true, "Number");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read the latest emotion published by the Emotion Face, chat, voice, or camera widgets.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_update"] = {
+  init: function () {
+    this.appendDummyInput().appendField("update team messages");
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Process waiting team messages. Use inside long-running loops.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_vector2"] = {
+  init: function () {
+    this.appendValueInput("X").setCheck("Number").appendField("position x");
+    this.appendValueInput("Y").setCheck("Number").appendField("y");
+    this.setInputsInline(true);
+    this.setOutput(true, "Array");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Create an (x, y) value that can be sent as one team message.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_vector_x"] = {
+  init: function () {
+    this.appendValueInput("VECTOR").setCheck("Array").appendField("x coordinate of");
+    this.setOutput(true, "Number");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read x from a received position pair.");
+    this.setHelpUrl("");
+  },
+};
+
+Blockly.Blocks["xrp_team_vector_y"] = {
+  init: function () {
+    this.appendValueInput("VECTOR").setCheck("Array").appendField("y coordinate of");
+    this.setOutput(true, "Number");
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Read y from a received position pair.");
+    this.setHelpUrl("");
+  },
+};

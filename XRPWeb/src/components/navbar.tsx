@@ -79,6 +79,8 @@ import backup_restore from '@assets/images/backup_restore.svg';
 import BackupRestoreDlg from '@components/dialogs/backup-restoredlg';
 import BackupDlg from '@components/dialogs/backupdlg';
 import RestoreDlg from '@components/dialogs/restoredlg';
+import MultiRobotSaveDialog from '@/components/dialogs/multi-robot-save-dialog';
+import type { MultiRobotEditorRequest, MultiRobotSaveRequest } from '@/connections/ideRobotTypes';
 
 type NavBarProps = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -128,6 +130,12 @@ function NavBar({ layoutref }: NavBarProps) {
     const dropdownRef = useRef<HTMLDivElement>(null);
     const stoppingRef = useRef(false);
     const browserCheckRef = useRef(false);
+    const multiRunSessionIdsRef = useRef<string[]>([]);
+    const activeEditorSession = EditorMgr.getInstance().getEditorSession(activeTab);
+    const isMultiRobotMode = Boolean(activeEditorSession?.multiRobotSessionIds?.length);
+    const syncActiveRunningState = () => {
+        setRunning(AppMgr.getInstance().getActiveRobotRuntimeState() === 'running');
+    };
 
     // Check for Web Serial API support once on component mount.
     useEffect(() => {
@@ -159,11 +167,16 @@ function NavBar({ layoutref }: NavBarProps) {
                     // clear the existing last file save time for Google Drive files
                     EditorMgr.getInstance().clearLastFileSaveTime();
                     setConnected(true);
-                    setRunning(false);
+                    syncActiveRunningState();
                 } else if (state === ConnectionState.Disconnected.toString()) {
                     setConnected(false);
+                    setRunning(false);
                     setXrpId(null);
                 }
+            });
+
+            AppMgr.getInstance().on(EventType.EVENT_ISRUNNING, (running: string) => {
+                setRunning(running === 'running');
             });
 
             AppMgr.getInstance().on(EventType.EVENT_ID, (id: string) => {
@@ -182,12 +195,44 @@ function NavBar({ layoutref }: NavBarProps) {
                 }
             });
 
+            AppMgr.getInstance().on(EventType.EVENT_CREATE_MULTI_ROBOT_EDITOR, (serialized: string) => {
+                const request = JSON.parse(serialized) as MultiRobotEditorRequest;
+                const filetype = request.fileType === 'blockly' ? FileType.BLOCKLY : FileType.PYTHON;
+                const initialContent = request.fileType === 'python'
+                    ? '# Multi-XRP program: Run executes this file on every assigned robot.\n'
+                    : undefined;
+                const newFileData: NewFileData = {
+                    parentId: '',
+                    name: request.name,
+                    path: `/${request.name}`,
+                    filetype,
+                    content: initialContent,
+                    robotSessionId: null,
+                    multiRobotSessionIds: request.sessionIds,
+                };
+                const tabId = CreateEditorTab(newFileData, layoutref);
+                setActiveTab(tabId);
+            });
+
+            AppMgr.getInstance().on(EventType.EVENT_MULTI_ROBOT_SAVE_REQUEST, (serialized: string) => {
+                const request = JSON.parse(serialized) as MultiRobotSaveRequest;
+                setDialogContent(
+                    <MultiRobotSaveDialog
+                        editorId={request.editorId}
+                        code={request.code}
+                        onClose={toggleDialog}
+                    />,
+                );
+                if (!dialogRef.current?.open) dialogRef.current?.showModal();
+            });
+
             AppMgr.getInstance().on(EventType.EVENT_OPEN_FILE, async (filePathDataJson: string) => {
                 const filePathData = JSON.parse(filePathDataJson);
                 const filename = filePathData.xrpPath.split('/').pop();
                 const searchParams: EdSearchParams = {
                     name: filename,
                     path: filePathData.xrpPath,
+                    robotSessionId: AppMgr.getInstance().getActiveRobotSessionId(),
                 };
                 if (filename && EditorMgr.getInstance().hasEditorSessionByName(searchParams)) {
                     EditorMgr.getInstance().SelectEditorTabByName(searchParams);
@@ -201,6 +246,7 @@ function NavBar({ layoutref }: NavBarProps) {
                     gparentId: filePathData.gparentId,
                     name: filename || '',
                     filetype: fileType,
+                    robotSessionId: AppMgr.getInstance().getActiveRobotSessionId(),
                 };
                 const tabId = CreateEditorTab(mewFileData, layoutref);
                 setActiveTab(tabId);
@@ -571,7 +617,9 @@ function NavBar({ layoutref }: NavBarProps) {
     function SaveFile() {
         console.log(t('saveFile'));
         if (EditorMgr.getInstance().hasEditorSession(activeTab)) {
+            const session = EditorMgr.getInstance().getEditorSession(activeTab);
             AppMgr.getInstance().emit(EventType.EVENT_SAVE_EDITOR, '');
+            if (session?.multiRobotSessionIds?.length) return;
             AppMgr.getInstance().on(EventType.EVENT_UPLOAD_DONE, () => {
                 toggleDialog();
                 AppMgr.getInstance().eventOff(EventType.EVENT_UPLOAD_DONE);
@@ -992,6 +1040,7 @@ function NavBar({ layoutref }: NavBarProps) {
      * @param running
      */
     function broadcastRunningState(running: boolean) {
+        AppMgr.getInstance().markActiveRobotRuntimeState(running ? 'running' : 'idle');
         AppMgr.getInstance().emit(EventType.EVENT_ISRUNNING, running ? 'running' : 'stopped');
     }
 
@@ -1035,6 +1084,53 @@ function NavBar({ layoutref }: NavBarProps) {
                 return;
             }
 
+            const selectedSession = EditorMgr.getInstance().getEditorSession(activeTab);
+            if (selectedSession && !EditorMgr.getInstance().targetsActiveRobot(selectedSession)) {
+                setDialogContent(
+                    <AlertDialog
+                        alertMessage="This tab belongs to another XRP. Select that robot in Multi-Agent Lab before running it."
+                        toggleDialog={toggleDialog}
+                    />,
+                );
+                toggleDialog();
+                return;
+            }
+
+            if (selectedSession?.multiRobotSessionIds?.length) {
+                const sessionIds = selectedSession.multiRobotSessionIds;
+                setRunning(true);
+                broadcastRunningState(true);
+                multiRunSessionIdsRef.current = sessionIds;
+                try {
+                    await AppMgr.getInstance().runProgramOnRobots(
+                        sessionIds,
+                        selectedSession.path,
+                        selectedSession.content ?? '',
+                    );
+                    selectedSession.isModified = false;
+                    EditorMgr.getInstance().SaveToLocalStorage(
+                        selectedSession,
+                        selectedSession.content ?? '',
+                    );
+                } catch (error) {
+                    setDialogContent(
+                        <AlertDialog
+                            alertMessage={error instanceof Error ? error.message : String(error)}
+                            toggleDialog={toggleDialog}
+                        />,
+                    );
+                    if (!dialogRef.current?.open) dialogRef.current?.showModal();
+                } finally {
+                    multiRunSessionIdsRef.current = [];
+                    syncActiveRunningState();
+                    setIsStopping(false);
+                    broadcastRunningState(
+                        AppMgr.getInstance().getActiveRobotRuntimeState() === 'running',
+                    );
+                }
+                return;
+            }
+
             setRunning(true);
             broadcastRunningState(true);
 
@@ -1045,13 +1141,35 @@ function NavBar({ layoutref }: NavBarProps) {
                     const connectionType = AppMgr.getInstance().getConnectionType();
                     const beginExecution = async () => {
                         try {
-                            // Save all unsaved editors before running
-                            await EditorMgr.getInstance().saveAllUnsavedEditors(activeTab);
-
-                            // Update the main.js
                             const session: EditorSession | undefined =
                                 EditorMgr.getInstance().getEditorSession(activeTab);
                             if (session) {
+                                const activeRobotSessionId = AppMgr.getInstance().getActiveRobotSessionId();
+                                if (activeRobotSessionId) {
+                                    try {
+                                        await AppMgr.getInstance().runProgramOnRobots(
+                                            [activeRobotSessionId],
+                                            session.path,
+                                            session.content ?? '',
+                                        );
+                                        session.isModified = false;
+                                        EditorMgr.getInstance().SaveToLocalStorage(
+                                            session,
+                                            session.content ?? '',
+                                        );
+                                    } finally {
+                                        syncActiveRunningState();
+                                        broadcastRunningState(
+                                            AppMgr.getInstance().getActiveRobotRuntimeState() === 'running',
+                                        );
+                                    }
+                                    return;
+                                }
+
+                                // Save all unsaved editors before running
+                                await EditorMgr.getInstance().saveAllUnsavedEditors(activeTab);
+
+                                // Update the main.js
                                 if (isLogin && session.gpath) {
                                     // saving the Google drive parent directory to XRP first
                                     await EditorMgr.getInstance().saveAllFilesInGoogleDriveToXRP(
@@ -1102,6 +1220,7 @@ function NavBar({ layoutref }: NavBarProps) {
 
                     const handlePowerSwitchCancel = () => {
                         setRunning(false);
+                        broadcastRunningState(false);
                         toggleDialog();
                     };
 
@@ -1144,8 +1263,32 @@ function NavBar({ layoutref }: NavBarProps) {
                     }
                 });
         } else {
+            if (multiRunSessionIdsRef.current.length > 0) {
+                setIsStopping(true);
+                setDialogContent(<BusyDialog title="Stopping programs on all XRPs" />);
+                if (!dialogRef.current?.open) dialogRef.current?.showModal();
+                try {
+                    await AppMgr.getInstance().stopProgramsOnRobots(multiRunSessionIdsRef.current);
+                } finally {
+                    multiRunSessionIdsRef.current = [];
+                    setRunning(false);
+                    setIsStopping(false);
+                    broadcastRunningState(false);
+                    if (dialogRef.current?.open) dialogRef.current.close();
+                }
+                return;
+            }
             setIsStopping(true);
-            CommandToXRPMgr.getInstance().stopProgram();
+            const activeRobotSessionId = AppMgr.getInstance().getActiveRobotSessionId();
+            if (activeRobotSessionId && AppMgr.getInstance().getActiveRobotRuntimeState() === 'running') {
+                void AppMgr.getInstance().stopProgramsOnRobots([activeRobotSessionId]).finally(() => {
+                    setRunning(false);
+                    setIsStopping(false);
+                    broadcastRunningState(false);
+                });
+            } else {
+                CommandToXRPMgr.getInstance().stopProgram();
+            }
             setDialogContent(<BusyDialog title={t('stopRunningProgram')} />);
             toggleDialog();
         }
@@ -1470,7 +1613,7 @@ function NavBar({ layoutref }: NavBarProps) {
                 </button>
                 <button
                     id="runBtn"
-                    className={`text-white h-full w-[120] items-center justify-center rounded-3xl px-4 py-2 ${isRunning ? 'bg-cinnabar-600' : 'bg-chateau-green-500'} ${isConnected ? 'flex' : 'hidden'}`}
+                    className={`text-white h-full w-[120] items-center justify-center rounded-3xl px-4 py-2 ${isMultiRobotMode ? (isRunning ? 'bg-purple-900' : 'bg-purple-700') : isRunning ? 'bg-cinnabar-600' : 'bg-chateau-green-500'} ${isConnected ? 'flex' : 'hidden'}`}
                     onClick={onRunBtnClicked}
                     disabled={isStopping}
                 >
@@ -1481,7 +1624,7 @@ function NavBar({ layoutref }: NavBarProps) {
                         </>
                     ) : (
                         <>
-                            <span>{t('run')}</span>
+                            <span>{isMultiRobotMode ? 'Run all' : t('run')}</span>
                             <IoPlaySharp />
                         </>
                     )}

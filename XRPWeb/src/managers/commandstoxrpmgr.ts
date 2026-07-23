@@ -52,9 +52,11 @@ export class CommandToXRPMgr {
     bleList = ["__init__.py","blerepl.py", "ble_uart_peripheral.py", "isrunning"] 
     XRPId:string | undefined = undefined;
 
-    constructor(){
-        this.getLibVersion();
-        this.getMicropythonVersion();
+    constructor(loadMetadata: boolean = true){
+        if (loadMetadata) {
+            void this.getLibVersion();
+            void this.getMicropythonVersion();
+        }
     }
 
     /**
@@ -719,16 +721,11 @@ export class CommandToXRPMgr {
         if (usePercent)
             AppMgr.getInstance().emit(EventType.EVENT_PROGRESS, '0');
 
-        // Convert strings to binary
-        let bytes: Uint8Array | undefined = undefined;
-        if (typeof fileContents == "string") {
-            bytes = new Uint8Array(fileContents.length);
-            for (let i = 0; i < fileContents.length; i++) {
-                bytes[i] = fileContents.charCodeAt(i);
-            }
-        } else {
-            bytes = fileContents;
-        }
+        // Encode text as UTF-8 so comments and strings with accents, ñ, or
+        // other Unicode characters remain valid when MicroPython reads them.
+        const bytes: Uint8Array = typeof fileContents === "string"
+            ? new TextEncoder().encode(fileContents)
+            : fileContents;
 
         //[TODO] - This should be just the length of what is available. Not just 2MB
         if ( this.PROCESSOR == 2040 && bytes.length >= 2000000) {
@@ -947,7 +944,7 @@ export class CommandToXRPMgr {
     /*** Run Program routines  ***/
 
     
-    async updateMainFile(fileToEx: string): Promise<string> {
+    async updateMainFile(fileToEx: string, usePercent: boolean = true): Promise<string> {
 
         if (this.BUSY == true) {
             return "";
@@ -1005,7 +1002,7 @@ export class CommandToXRPMgr {
 
         if (this.lastRun == undefined || this.lastRun != fileToEx) {
             this.BUSY = false; // make sure we are not busy before uploading the file
-            await this.uploadFile("//main.py", value, true); //no need to save the main file again if it is the same file to execute.
+            await this.uploadFile("//main.py", value, usePercent); //no need to save the main file again if it is the same file to execute.
             this.BUSY = true; // make sure we are busy after uploading the file
         }
         this.lastRun = fileToEx;
@@ -1014,7 +1011,10 @@ export class CommandToXRPMgr {
         return value;
     }
 
-    async executeLines(lines: string) {
+    async executeLines(
+        lines: string,
+        options: { refreshFilesystem?: boolean; emitProgramExecuted?: boolean } = {},
+    ) {
         if (this.BUSY == true) {
             return;
         }
@@ -1045,21 +1045,28 @@ export class CommandToXRPMgr {
         if (this.DEBUG_CONSOLE_ON) this.cmdLogger.debug("fcg: out of executeLines");
 
         // Make sure to update the filesystem as there is a small chance that the program saved something like a log file.
-        setTimeout(() => {
-            this.getOnBoardFSTree().then(() => {
-                // File system tree updated after execution
-                AppMgr.getInstance().emit(EventType.EVENT_PROGRAM_EXECUTED, '');
+        const refreshFilesystem = options.refreshFilesystem ?? true;
+        const emitProgramExecuted = options.emitProgramExecuted ?? true;
+        if (refreshFilesystem) {
+            setTimeout(() => {
+                this.getOnBoardFSTree().then(() => {
+                    if (emitProgramExecuted) {
+                        AppMgr.getInstance().emit(EventType.EVENT_PROGRAM_EXECUTED, '');
+                    }
+                });
             });
-        });
+        } else if (emitProgramExecuted) {
+            AppMgr.getInstance().emit(EventType.EVENT_PROGRAM_EXECUTED, '');
+        }
     }
 
     /**
      * stopProgram - stop program execution on the XRP because they pushed the STOP button
      */
-    stopProgram() {
+    async stopProgram(): Promise<void> {
         if (this.connection) {
-            this.connection.prepareForStop();
-            this.connection.getToREPL();
+            await this.connection.prepareForStop();
+            await this.connection.getToREPL();
             this.BUSY = false;
         }
     }

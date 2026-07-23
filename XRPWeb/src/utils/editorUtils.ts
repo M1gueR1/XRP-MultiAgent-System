@@ -35,6 +35,10 @@ export function CreateEditorTab(data: NewFileData, layoutref: React.RefObject<La
                     content: data.content,
                     lastUpdated: new Date(),
                     isModified: false,
+                    robotSessionId: data.multiRobotSessionIds?.length
+                        ? null
+                        : data.robotSessionId ?? AppMgr.getInstance().getActiveRobotSessionId(),
+                    multiRobotSessionIds: data.multiRobotSessionIds,
                 });
                 return uniqueId;
             }
@@ -62,6 +66,10 @@ export function CreateEditorTab(data: NewFileData, layoutref: React.RefObject<La
                     content: data.content,
                     lastUpdated: new Date(),
                     isModified: false,
+                    robotSessionId: data.multiRobotSessionIds?.length
+                        ? null
+                        : data.robotSessionId ?? AppMgr.getInstance().getActiveRobotSessionId(),
+                    multiRobotSessionIds: data.multiRobotSessionIds,
                 });
                 return uniqueId;
             }

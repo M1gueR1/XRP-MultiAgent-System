@@ -59,6 +59,16 @@ const BUILTIN_SENSORS: BuiltinSensorDef[] = [
     minH: 7,
     componentName: "RobotChatWidget",
   },
+  {
+    action: "multiAgentLab",
+    icon: FaRobot,
+    titleKey: "Multi-Agent Lab",
+    gridH: 12,
+    gridW: 8,
+    minW: 5,
+    minH: 8,
+    componentName: "MultiAgentLabWidget",
+  },
 ];
 
 const AddWidgets: React.FC = () => {
@@ -110,15 +120,19 @@ const AddWidgets: React.FC = () => {
         className="flex items-center mt-4 sm:mt-0"
       >
         {/* Built-in sensors */}
-        {BUILTIN_SENSORS.map((def) => (
-          <DropdownItem
-            key={def.action}
-            icon={def.icon as any}
-            onClick={() => handleAddBuiltin(def)}
-          >
-            {t(def.titleKey)}
-          </DropdownItem>
-        ))}
+        {BUILTIN_SENSORS.map((def) => {
+          const Icon = def.icon;
+          const DropdownIcon: React.FC<React.SVGProps<SVGSVGElement>> = () => <Icon />;
+          return (
+            <DropdownItem
+              key={def.action}
+              icon={DropdownIcon}
+              onClick={() => handleAddBuiltin(def)}
+            >
+              {t(def.titleKey)}
+            </DropdownItem>
+          );
+        })}
 
         {/* Custom Variable (bidirectional XPP variable inspector/editor) */}
         <hr className="my-1 border-gray-200" />

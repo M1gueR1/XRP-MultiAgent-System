@@ -37,6 +37,7 @@ abstract class Connection {
     private isCollectedRawData: boolean = false;
     private buffer: Uint8Array = new Uint8Array(0);
     private STOP: boolean = false;
+    private ideActive: boolean = true;
 
     // Set to something not "" to halt until this.READ_UNTIL_STRING found and collect lines in this.COLLECTED_DATA
     private readUntilStr = '';
@@ -269,8 +270,13 @@ abstract class Connection {
      * @param tableMgr - Optional TableMgr instance for handling table-related XPP messages
      */
     protected processXPPPacket(packet: Uint8Array, tableMgr?: TableMgr): void {
+        if (!this.ideActive) return;
         this.joyStick?.handleXPPMessage(packet);
         tableMgr?.readFromDevice(packet);
+    }
+
+    public setIDEActive(active: boolean): void {
+        this.ideActive = active;
     }
 
     

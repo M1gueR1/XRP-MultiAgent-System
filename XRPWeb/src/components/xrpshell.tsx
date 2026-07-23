@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { FitAddon } from '@xterm/addon-fit';
 import { useXTerm } from 'react-xtermjs';
 import AppMgr, { EventType, Themes } from '@/managers/appmgr';
@@ -81,17 +81,30 @@ function captureTerminalContent(instance: any): string {
 function XRPShell() {
     const { t } = useTranslation();
     const { instance, ref } = useXTerm();
-    const [isConnected, setIsConnected] = useState(false);
     const listenerRef = useRef<IDisposable | null>(null);
 
     useEffect(() => {
+        const appMgr = AppMgr.getInstance();
         const fitAddon = new FitAddon();
+        let handleTheme: ((theme: string) => void) | undefined;
+        let handleConnectionStatus: ((state: string) => void) | undefined;
+        let handleShell: ((data: string) => void) | undefined;
+
         if (instance) {
+            const writeAndCapture = (data: string) => {
+                instance.write(data);
+                setTimeout(() => {
+                    const content = captureTerminalContent(instance);
+                    const lineCount = instance.buffer?.active?.length || 0;
+                    TerminalMgr.updateLiveTerminalContent(TERMINAL_ID, content, lineCount);
+                }, 10);
+            };
+
             const darkTheme = { foreground: '#ddd', background: '#333333', cursor: '#ddd' };
             const lightTheme = { foreground: '#41393b', background: '#f0eff0', cursor: '#41393b' };
 
             instance?.loadAddon(fitAddon);
-            const theme = AppMgr.getInstance().getTheme() === Themes.DARK ? darkTheme : lightTheme;
+            const theme = appMgr.getTheme() === Themes.DARK ? darkTheme : lightTheme;
             instance.options = {
                 cursorStyle: 'underline',
                 cursorInactiveStyle: 'bar',
@@ -101,30 +114,25 @@ function XRPShell() {
                 theme: theme,
             };
 
-            AppMgr.getInstance().on(EventType.EVENT_THEME, (theme) => {
+            handleTheme = (theme) => {
                 if (theme === Themes.DARK) {
                     instance.options.theme = darkTheme;
                 } else {
                     instance.options.theme = lightTheme;
                 }
-            });
+            };
 
-            AppMgr.getInstance().on(EventType.EVENT_CONNECTION_STATUS, (state: string) => {
+            handleConnectionStatus = (state: string) => {
                 if (state === ConnectionState.Connected.toString()) {
-                    const activeConn: Connection | null = AppMgr.getInstance().getConnection();
-                    if (activeConn != null) {
-                        activeConn.onData = (data) => {
-                            instance.write(data);
-                            
-                            // Capture terminal content after data is written
-                            setTimeout(() => {
-                                const content = captureTerminalContent(instance);
-                                const lineCount = instance.buffer?.active?.length || 0;
-                                TerminalMgr.updateLiveTerminalContent(TERMINAL_ID, content, lineCount);
-                            }, 10); // Small delay to ensure content is rendered
-                        };
+                    instance.clear();
+                    const bufferedOutput = appMgr.consumeActiveRobotTerminalBuffer();
+                    if (bufferedOutput) {
+                        instance.write(bufferedOutput);
                     }
-                    setIsConnected(true);
+                    const activeConn: Connection | null = appMgr.getConnection();
+                    if (activeConn != null) {
+                        activeConn.onData = writeAndCapture;
+                    }
                 } else if (state === ConnectionState.Disconnected.toString()) {
                     instance?.clear();
                     instance?.writeln(t('disconnectXterm'));
@@ -137,35 +145,31 @@ function XRPShell() {
                         const lineCount = instance.buffer?.active?.length || 0;
                         TerminalMgr.updateLiveTerminalContent(TERMINAL_ID, content, lineCount);
                     }, 10);
-                    setIsConnected(false);
                 }
-            });
+            };
 
-            if (!isConnected && AppMgr.getInstance().getConnection() != null) {
-                const activeConn: Connection | null = AppMgr.getInstance().getConnection();
+            handleShell = writeAndCapture;
+            appMgr.on(EventType.EVENT_THEME, handleTheme);
+            appMgr.on(EventType.EVENT_CONNECTION_STATUS, handleConnectionStatus);
+            appMgr.on(EventType.EVENT_SHELL, handleShell);
+
+            if (appMgr.getConnection() != null) {
+                const activeConn: Connection | null = appMgr.getConnection();
                 if (activeConn != null) {
-                    activeConn.onData = (data) => {
-                        instance.write(data);
-
-                            // Capture terminal content after data is written
-                            setTimeout(() => {
-                                const content = captureTerminalContent(instance);
-                                const lineCount = instance.buffer?.active?.length || 0;
-                                TerminalMgr.updateLiveTerminalContent(TERMINAL_ID, content, lineCount);
-                            }, 10); // Small delay to ensure content is rendered
-                    }
+                    activeConn.onData = writeAndCapture;
                 }
                 // can only be subscribed to once
-                listenerRef.current = instance?.onData((data) => {
-                    const activeConn: Connection | null = AppMgr.getInstance().getConnection();
-                    if (activeConn) {
-                        if (activeConn.isBusy()) {
-                            return;
+                if (!listenerRef.current) {
+                    listenerRef.current = instance?.onData((data) => {
+                        const activeConn: Connection | null = appMgr.getConnection();
+                        if (activeConn) {
+                            if (activeConn.isBusy()) {
+                                return;
+                            }
+                            activeConn.writeToDevice(data);
                         }
-                        activeConn.writeToDevice(data);
-                    }
-                });
-                setIsConnected(true);
+                    });
+                }
             }
 
             fitAddon.fit();
@@ -177,9 +181,14 @@ function XRPShell() {
         // Cleanup function to remove terminal content when component unmounts
         return () => {
             window.removeEventListener('resize', handleResize);
+            if (handleTheme) appMgr.eventOff(EventType.EVENT_THEME, handleTheme);
+            if (handleConnectionStatus) appMgr.eventOff(EventType.EVENT_CONNECTION_STATUS, handleConnectionStatus);
+            if (handleShell) appMgr.eventOff(EventType.EVENT_SHELL, handleShell);
+            listenerRef.current?.dispose();
+            listenerRef.current = null;
             TerminalMgr.removeLiveTerminalContent(TERMINAL_ID);
         };
-    }, [instance, isConnected, t]);
+    }, [instance, t]);
 
     return (
         <>

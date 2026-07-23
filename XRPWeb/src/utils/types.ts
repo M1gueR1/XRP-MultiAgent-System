@@ -54,6 +54,8 @@ export type NewFileData = {
     filetype: FileType
     parentId: string;
     content?: string;
+    robotSessionId?: string | null;
+    multiRobotSessionIds?: string[];
 }
 
 export type FileData = {

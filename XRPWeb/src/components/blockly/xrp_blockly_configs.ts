@@ -226,6 +226,73 @@ const ToolboxJson = {
         },
         {
             "kind": "CATEGORY",
+            "name": "XRP Team Messages",
+            "colour": "#f2b705",
+            "contents": [
+                { "kind": "BLOCK", "type": "xrp_team_start" },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_broadcast",
+                    "inputs": {
+                        "VALUE": { "shadow": { "type": "xrp_getsonardist" } }
+                    }
+                },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_send_to_name",
+                    "inputs": {
+                        "VALUE": { "shadow": { "type": "math_number", "fields": { "NUM": 0 } } },
+                        "TARGET": { "shadow": { "type": "text", "fields": { "TEXT": "Blue XRP" } } }
+                    }
+                },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_send_to_id",
+                    "inputs": {
+                        "VALUE": { "shadow": { "type": "math_number", "fields": { "NUM": 0 } } },
+                        "TARGET": { "shadow": { "type": "math_number", "fields": { "NUM": 1 } } }
+                    }
+                },
+                { "kind": "BLOCK", "type": "xrp_team_has_message" },
+                { "kind": "BLOCK", "type": "xrp_team_read" },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_has_message_from_name",
+                    "inputs": {
+                        "SOURCE": { "shadow": { "type": "text", "fields": { "TEXT": "Blue XRP" } } }
+                    }
+                },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_has_message_from_id",
+                    "inputs": {
+                        "SOURCE": { "shadow": { "type": "math_number", "fields": { "NUM": 1 } } }
+                    }
+                },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_read_from_name",
+                    "inputs": {
+                        "SOURCE": { "shadow": { "type": "text", "fields": { "TEXT": "Blue XRP" } } }
+                    }
+                },
+                {
+                    "kind": "BLOCK",
+                    "type": "xrp_team_read_from_id",
+                    "inputs": {
+                        "SOURCE": { "shadow": { "type": "math_number", "fields": { "NUM": 1 } } }
+                    }
+                },
+                { "kind": "BLOCK", "type": "xrp_team_sender" },
+                { "kind": "BLOCK", "type": "xrp_team_sender_name" },
+                { "kind": "BLOCK", "type": "xrp_team_my_id" },
+                { "kind": "BLOCK", "type": "xrp_team_ready" },
+                { "kind": "BLOCK", "type": "xrp_team_dashboard_emotion" },
+                { "kind": "BLOCK", "type": "xrp_team_update" }
+            ]
+        },
+        {
+            "kind": "CATEGORY",
             "name": "Web Server",
             "colour": "#5b99a5", // turquoise
             "contents": [

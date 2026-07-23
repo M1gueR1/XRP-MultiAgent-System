@@ -13,6 +13,9 @@ import { ConnectionType, EditorType, FolderItem } from '@/utils/types';
 import { BluetoothConnection } from '@/connections/bluetoothconnection';
 import GoogleAuthService from '@/services/google-auth';
 import GoogleDriveService from '@/services/google-drive';
+import type { USBRobotFleetSnapshot } from '@/connections/usbFleetTypes';
+import type { BLERobotFleetSnapshot } from '@/connections/bluetoothFleetTypes';
+import type { IDERobotTargetSnapshot } from '@/connections/ideRobotTypes';
 
 export enum Themes {
     DARK = 'dark',
@@ -59,6 +62,10 @@ export enum EventType {
     EVENT_SHOWBLUETOOTH_CONNECTING = 'show-bluetooth-connecting', // Show Bluetooth connecting dialog
     EVENT_HIDE_BLUETOOTH_CONNECTING = 'hide-bluetooth-connecting', // Hide Bluetooth connecting dialog
     EVENT_EDITOR_NAME_CHANGED = 'editor-name-changed', // Editor name changed
+    EVENT_USB_FLEET = 'usb-fleet', // multi-USB robot connection and selection updates
+    EVENT_BLE_IDE_FLEET = 'ble-ide-fleet', // multi-Bluetooth full IDE connection updates
+    EVENT_CREATE_MULTI_ROBOT_EDITOR = 'create-multi-robot-editor',
+    EVENT_MULTI_ROBOT_SAVE_REQUEST = 'multi-robot-save-request',
 }
 
 type Events = {
@@ -96,6 +103,10 @@ type Events = {
     [EventType.EVENT_SHOWBLUETOOTH_CONNECTING]: string;
     [EventType.EVENT_HIDE_BLUETOOTH_CONNECTING]: string;
     [EventType.EVENT_EDITOR_NAME_CHANGED]: string;
+    [EventType.EVENT_USB_FLEET]: string;
+    [EventType.EVENT_BLE_IDE_FLEET]: string;
+    [EventType.EVENT_CREATE_MULTI_ROBOT_EDITOR]: string;
+    [EventType.EVENT_MULTI_ROBOT_SAVE_REQUEST]: string;
 };
 
 /**
@@ -161,7 +172,7 @@ export default class AppMgr {
      * stop clean up connection and object etcs.
      */
     public stop(): void {
-        this._connectionMgr?.getConnection()?.disconnect();
+        this._connectionMgr?.stop();
         this.off();
     }
 
@@ -246,6 +257,131 @@ export default class AppMgr {
             throw new Error('Connection manager is not initialized');
         }
         return this._connectionMgr.getConnection();
+    }
+
+    public async addUSBRobot(): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.addUSBRobot();
+    }
+
+    public async selectUSBRobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.selectUSBRobot(sessionId);
+    }
+
+    public async reconnectUSBRobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.reconnectUSBRobot(sessionId);
+    }
+
+    public async disconnectUSBRobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.disconnectUSBRobot(sessionId);
+    }
+
+    public async removeUSBRobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.removeUSBRobot(sessionId);
+    }
+
+    public renameUSBRobot(sessionId: string, alias: string): void {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        this._connectionMgr.renameUSBRobot(sessionId, alias);
+    }
+
+    public async disconnectAllUSBRobots(): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.disconnectAllUSB();
+    }
+
+    public getUSBFleetSnapshot(): USBRobotFleetSnapshot {
+        return this._connectionMgr?.getUSBFleetSnapshot() ?? {
+            supported: typeof navigator !== 'undefined' && 'serial' in navigator,
+            activeSessionId: null,
+            sessions: [],
+        };
+    }
+
+    public getActiveRobotSessionId(): string | null {
+        return this._connectionMgr?.getActiveRobotSessionId() ?? null;
+    }
+
+    public getActiveRobotRuntimeState(): 'idle' | 'running' {
+        return this._connectionMgr?.getActiveRobotRuntimeState() ?? 'idle';
+    }
+
+    public getActiveRobotTerminalBuffer(): string {
+        return this._connectionMgr?.getActiveRobotTerminalBuffer() ?? '';
+    }
+
+    public consumeActiveRobotTerminalBuffer(): string {
+        return this._connectionMgr?.consumeActiveRobotTerminalBuffer() ?? '';
+    }
+
+    public markActiveRobotRuntimeState(runtimeState: 'idle' | 'running'): void {
+        this._connectionMgr?.markActiveRobotRuntimeState(runtimeState);
+    }
+
+    public async addBluetoothIDERobot(): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.addBluetoothRobot();
+    }
+
+    public async selectBluetoothIDERobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.selectBluetoothRobot(sessionId);
+    }
+
+    public async reconnectBluetoothIDERobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.reconnectBluetoothRobot(sessionId);
+    }
+
+    public async disconnectBluetoothIDERobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.disconnectBluetoothRobot(sessionId);
+    }
+
+    public async removeBluetoothIDERobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.removeBluetoothRobot(sessionId);
+    }
+
+    public renameBluetoothIDERobot(sessionId: string, alias: string): void {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        this._connectionMgr.renameBluetoothRobot(sessionId, alias);
+    }
+
+    public async disconnectAllBluetoothIDERobots(): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.disconnectAllBluetooth();
+    }
+
+    public getBluetoothIDEFleetSnapshot(): BLERobotFleetSnapshot {
+        return this._connectionMgr?.getBLEFleetSnapshot() ?? {
+            supported: typeof navigator !== 'undefined' && Boolean(navigator.bluetooth),
+            activeSessionId: null,
+            sessions: [],
+        };
+    }
+
+    public getConnectedIDERobots(sessionIds?: string[]): IDERobotTargetSnapshot[] {
+        return this._connectionMgr?.getConnectedIDERobots(sessionIds) ?? [];
+    }
+
+    public async saveFileToRobots(sessionIds: string[], path: string, content: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.saveFileToRobots(sessionIds, path, content);
+    }
+
+    public async runProgramOnRobots(sessionIds: string[], path: string, content: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.runProgramOnRobots(sessionIds, path, content);
+    }
+
+    public async stopProgramsOnRobots(sessionIds: string[]): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.stopProgramsOnRobots(sessionIds);
     }
 
     /**

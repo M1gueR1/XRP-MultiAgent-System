@@ -235,6 +235,7 @@ function FolderTree(treeProps: TreeProps) {
                             const seachParams: EdSearchParams = {
                                 name: node.data.name,
                                 path: filePath,
+                                robotSessionId: AppMgr.getInstance().getActiveRobotSessionId(),
                             }
                             EditorMgr.getInstance().SelectEditorTabByName(seachParams);
                         }

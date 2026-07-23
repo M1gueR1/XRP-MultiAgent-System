@@ -4,6 +4,127 @@ import {
   getEmotionEntryByName,
 } from "./emotionCatalogBridge";
 
+function setupTeamCommunicationGenerator() {
+  pythonGenerator.definitions_["import_multiagent_team"] =
+    "from MultiAgentLib.team import get_default_team";
+  pythonGenerator.definitions_["multiagent_team_setup"] = [
+    "xrpTeam = get_default_team()",
+    "xrpTeam.start()",
+  ].join("\n");
+}
+
+function teamChannel(block) {
+  const channel = String(block.getFieldValue("CHANNEL") || "message")
+    .trim()
+    .toLowerCase();
+  return JSON.stringify(channel || "message");
+}
+
+function teamMode(block) {
+  return block.getFieldValue("MODE") === "EVENT" ? "event" : "latest";
+}
+
+pythonGenerator.forBlock["xrp_team_start"] = function () {
+  setupTeamCommunicationGenerator();
+  pythonGenerator.definitions_["import_time"] = "import time";
+  return [
+    "while not xrpTeam.is_ready():",
+    "  xrpTeam.update()",
+    "  time.sleep(0.05)",
+    "",
+  ].join("\n");
+};
+
+pythonGenerator.forBlock["xrp_team_broadcast"] = function (block) {
+  setupTeamCommunicationGenerator();
+  const value = pythonGenerator.valueToCode(block, "VALUE", pythonGenerator.ORDER_NONE) || "None";
+  return `xrpTeam.broadcast(${teamChannel(block)}, ${value}, mode="${teamMode(block)}")\n`;
+};
+
+pythonGenerator.forBlock["xrp_team_send"] = function (block) {
+  setupTeamCommunicationGenerator();
+  const value = pythonGenerator.valueToCode(block, "VALUE", pythonGenerator.ORDER_NONE) || "None";
+  const target = pythonGenerator.valueToCode(block, "TARGET", pythonGenerator.ORDER_NONE) || '"all"';
+  return `xrpTeam.send(${teamChannel(block)}, ${value}, target=${target}, mode="${teamMode(block)}")\n`;
+};
+
+pythonGenerator.forBlock["xrp_team_send_to_name"] = pythonGenerator.forBlock["xrp_team_send"];
+pythonGenerator.forBlock["xrp_team_send_to_id"] = pythonGenerator.forBlock["xrp_team_send"];
+
+pythonGenerator.forBlock["xrp_team_has_message"] = function (block) {
+  setupTeamCommunicationGenerator();
+  return [`xrpTeam.has_message(${teamChannel(block)})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_read"] = function (block) {
+  setupTeamCommunicationGenerator();
+  return [`xrpTeam.read(${teamChannel(block)})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_has_message_from"] = function (block) {
+  setupTeamCommunicationGenerator();
+  const source = pythonGenerator.valueToCode(block, "SOURCE", pythonGenerator.ORDER_NONE) || "0";
+  return [`xrpTeam.has_message_from(${teamChannel(block)}, ${source})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_has_message_from_name"] = pythonGenerator.forBlock["xrp_team_has_message_from"];
+pythonGenerator.forBlock["xrp_team_has_message_from_id"] = pythonGenerator.forBlock["xrp_team_has_message_from"];
+
+pythonGenerator.forBlock["xrp_team_read_from"] = function (block) {
+  setupTeamCommunicationGenerator();
+  const source = pythonGenerator.valueToCode(block, "SOURCE", pythonGenerator.ORDER_NONE) || "0";
+  return [`xrpTeam.read_from(${teamChannel(block)}, ${source})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_read_from_name"] = pythonGenerator.forBlock["xrp_team_read_from"];
+pythonGenerator.forBlock["xrp_team_read_from_id"] = pythonGenerator.forBlock["xrp_team_read_from"];
+
+pythonGenerator.forBlock["xrp_team_sender"] = function (block) {
+  setupTeamCommunicationGenerator();
+  return [`xrpTeam.sender(${teamChannel(block)})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_sender_name"] = function (block) {
+  setupTeamCommunicationGenerator();
+  return [`xrpTeam.sender_name(${teamChannel(block)})`, pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_my_id"] = function () {
+  setupTeamCommunicationGenerator();
+  return ["xrpTeam.robot_id", pythonGenerator.ORDER_MEMBER];
+};
+
+pythonGenerator.forBlock["xrp_team_ready"] = function () {
+  setupTeamCommunicationGenerator();
+  return ["xrpTeam.is_ready()", pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_dashboard_emotion"] = function () {
+  setupTeamCommunicationGenerator();
+  return ['xrpTeam.read("emotion", 0)', pythonGenerator.ORDER_FUNCTION_CALL];
+};
+
+pythonGenerator.forBlock["xrp_team_update"] = function () {
+  setupTeamCommunicationGenerator();
+  return "xrpTeam.update()\n";
+};
+
+pythonGenerator.forBlock["xrp_team_vector2"] = function (block) {
+  const x = pythonGenerator.valueToCode(block, "X", pythonGenerator.ORDER_NONE) || "0";
+  const y = pythonGenerator.valueToCode(block, "Y", pythonGenerator.ORDER_NONE) || "0";
+  return [`(${x}, ${y})`, pythonGenerator.ORDER_ATOMIC];
+};
+
+pythonGenerator.forBlock["xrp_team_vector_x"] = function (block) {
+  const vector = pythonGenerator.valueToCode(block, "VECTOR", pythonGenerator.ORDER_MEMBER) || "(0, 0)";
+  return [`${vector}[0]`, pythonGenerator.ORDER_MEMBER];
+};
+
+pythonGenerator.forBlock["xrp_team_vector_y"] = function (block) {
+  const vector = pythonGenerator.valueToCode(block, "VECTOR", pythonGenerator.ORDER_MEMBER) || "(0, 0)";
+  return [`${vector}[1]`, pythonGenerator.ORDER_MEMBER];
+};
+
 
 // ---------------------------------------------------------
 // Red Vision preload configuration
@@ -1615,8 +1736,22 @@ pythonGenerator.forBlock['xrp_gp_button_pressed'] = function (block) {
 //Logic
 pythonGenerator.forBlock['xrp_sleep'] = function (block) {
   pythonGenerator.definitions_['import_time'] = 'import time';
-  var number_time = pythonGenerator.valueToCode(block, 'TIME', pythonGenerator.ORDER_ATOMIC);
-  var code = `time.sleep(${number_time})\n`;
+  var number_time = pythonGenerator.valueToCode(block, 'TIME', pythonGenerator.ORDER_ATOMIC) || "0";
+  pythonGenerator.definitions_['xrp_sleep_helper'] = [
+    "def xrp_sleep(duration_s):",
+    "    try:",
+    "        team = xrpTeam",
+    "    except NameError:",
+    "        time.sleep(duration_s)",
+    "        return",
+    "    duration_ms = int(float(duration_s) * 1000)",
+    "    start_ms = time.ticks_ms()",
+    "    while time.ticks_diff(time.ticks_ms(), start_ms) < duration_ms:",
+    "        team.update()",
+    "        remaining_ms = duration_ms - time.ticks_diff(time.ticks_ms(), start_ms)",
+    "        time.sleep(min(0.05, max(0, remaining_ms) / 1000.0))",
+  ].join("\n");
+  var code = `xrp_sleep(${number_time})\n`;
   return code;
 };
 
