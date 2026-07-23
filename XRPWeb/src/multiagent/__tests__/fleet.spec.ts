@@ -74,6 +74,33 @@ describe("RobotFleetManager routing", () => {
     expect(new TextDecoder().decode(directory!.applicationPayload.slice(4, 4 + aliasLength))).toBe("Blue XRP");
   });
 
+  it("re-publishes the alias directory when a ready robot refreshes its HELLO", async () => {
+    const manager = new RobotFleetManager();
+    managers.push(manager);
+    const transport = new VirtualRobotTransport({ identity: "directory-refresh" });
+    const session = await manager.attachExternalRobot("usb-ide:directory", transport, "XRP B");
+    await waitUntil(() => session.state === "ready");
+    const directoryCount = () => transport.receivedMessages.filter(
+      (message) => message.topicId === MultiAgentTopic.TEAM_DIRECTORY,
+    ).length;
+    const before = directoryCount();
+
+    transport.emitRawMessageFromRobot({
+      protocolVersion: MULTI_AGENT_PROTOCOL_VERSION,
+      messageKind: MultiAgentMessageKind.HELLO,
+      flags: 0,
+      sourceRobotId: UNASSIGNED_ROBOT_ID,
+      targetRobotId: LAPTOP_COORDINATOR_ID,
+      sequence: 99,
+      topicId: 0,
+      ttlMilliseconds: 5000,
+      applicationPayload: encodeHelloPayload(defaultVirtualCapabilities("directory-refresh")),
+    });
+
+    await waitUntil(() => directoryCount() > before);
+    expect(session.state).toBe("ready");
+  });
+
   it("accepts restarted robot sequence numbers on consecutive external program runs", async () => {
     const manager = new RobotFleetManager();
     managers.push(manager);

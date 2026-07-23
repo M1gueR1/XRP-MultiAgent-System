@@ -368,7 +368,6 @@ export class RobotFleetManager {
       return;
     }
     try {
-      const wasReady = session.state === 'ready';
       const capabilities = decodeHelloPayload(message.applicationPayload);
       if (capabilities.protocolVersion !== MULTI_AGENT_PROTOCOL_VERSION) throw new Error("Incompatible protocol version.");
       if (session.hardwareIdentity && session.hardwareIdentity !== capabilities.hardwareIdentity) {
@@ -396,7 +395,9 @@ export class RobotFleetManager {
       this.ensureHeartbeatTimer();
       this.log(UNASSIGNED_ROBOT_ID, robotId, 0, message.sequence, "handshake-ready");
       this.notify();
-      if (!wasReady) await this.broadcastTeamDirectory();
+      // HELLO is also a periodic identity refresh. Re-publishing the directory
+      // lets a robot recover if its first alias announcement was missed.
+      await this.broadcastTeamDirectory();
     } catch {
       session.metrics.invalidPackets += 1;
       session.markError();

@@ -1,6 +1,15 @@
+export type IDERobotRuntimeState = 'idle' | 'starting' | 'running' | 'stopping';
+
 export interface IDERobotTargetSnapshot {
     sessionId: string;
     alias: string;
+    transport: 'usb' | 'bluetooth';
+}
+
+export interface IDERobotRunPreflight {
+    voltage: number;
+    isNanoXRP: boolean;
+    xrpDrive: string;
     transport: 'usb' | 'bluetooth';
 }
 

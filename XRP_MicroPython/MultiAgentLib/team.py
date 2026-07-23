@@ -196,7 +196,15 @@ class TeamLink:
             sleep_ms(10)
         if normalized in self._directory:
             return self._directory[normalized]
-        raise ValueError("unknown robot alias: " + str(target))
+        known_aliases = sorted(self._directory.keys())
+        if known_aliases:
+            raise ValueError(
+                "unknown robot alias: "
+                + str(target)
+                + "; known aliases: "
+                + ", ".join(known_aliases)
+            )
+        raise ValueError("unknown robot alias: " + str(target) + "; no teammate aliases are ready")
 
     def send(self, channel, value, target=BROADCAST_ROBOT_ID, mode="latest"):
         if self._started:

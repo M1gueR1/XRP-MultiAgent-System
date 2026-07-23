@@ -158,6 +158,18 @@ export class CommandToXRPMgr {
         this.connection = connection;
     }
 
+    /**
+     * Session command managers reuse the hardware facts discovered by the
+     * legacy active command manager without sharing its mutable connection.
+     */
+    public copyHardwareStateFrom(source: CommandToXRPMgr): void {
+        this.PROCESSOR = source.PROCESSOR;
+        this.HAS_MICROPYTHON = source.HAS_MICROPYTHON;
+        this.is_XRP_MP = source.is_XRP_MP;
+        this.is_NanoXRP = source.is_NanoXRP;
+        this.XRPId = source.XRPId;
+    }
+
     /*** Initial utilities  ***/
 
     // if we attached via the cable then make sure we are not trying to output to via the BLE
@@ -207,21 +219,28 @@ export class CommandToXRPMgr {
         if (this.BUSY == true) {
             return 0;
         }
-        this.BUSY = true;
-
-        let vpin = '28';
-        if (this.is_XRP_MP) {
-            vpin = "'BOARD_VIN_MEASURE'";
+        const connection = this.connection;
+        if (!connection?.isConnected()) {
+            throw new Error('No XRP is connected.');
         }
+        this.BUSY = true;
+        try {
+            let vpin = '28';
+            if (this.is_XRP_MP) {
+                vpin = "'BOARD_VIN_MEASURE'";
+            }
 
-        const cmd = 'from machine import ADC, Pin\n' + 'print(ADC(Pin(' + vpin + ')).read_u16())\n';
-
-        const hiddenLines = await this.connection?.writeUtilityCmdRaw(cmd, true, 1);
-
-        await this.connection?.getToNormal(3);
-        this.BUSY = false;
-        const value = parseInt(hiddenLines![0].substring(2)); //get the string after the OK
-        return value / ((1024 * 64) / 14); //the voltage ADC is 64k (RP2040 ADC is 0-4095 but micropython adjusts it to 0 - 64K) And while the voltage is a max of 11V, the divider comes out close to 14V
+            const cmd = 'from machine import ADC, Pin\n' + 'print(ADC(Pin(' + vpin + ')).read_u16())\n';
+            const hiddenLines = await connection.writeUtilityCmdRaw(cmd, true, 1);
+            await connection.getToNormal(3);
+            if (!hiddenLines?.[0]) {
+                throw new Error('The XRP did not return a battery voltage.');
+            }
+            const value = parseInt(hiddenLines[0].substring(2)); //get the string after the OK
+            return value / ((1024 * 64) / 14); //the voltage ADC is 64k (RP2040 ADC is 0-4095 but micropython adjusts it to 0 - 64K) And while the voltage is a max of 11V, the divider comes out close to 14V
+        } finally {
+            this.BUSY = false;
+        }
     }
 
     public async getVersionInfo(): Promise<(string | undefined)[]> {

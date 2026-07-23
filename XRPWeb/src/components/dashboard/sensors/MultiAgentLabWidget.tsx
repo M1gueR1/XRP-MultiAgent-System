@@ -12,7 +12,7 @@ import {
 import AppMgr, { EventType } from "@/managers/appmgr";
 import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import type { BLERobotFleetSnapshot } from "@/connections/bluetoothFleetTypes";
-import type { MultiRobotEditorRequest } from "@/connections/ideRobotTypes";
+import type { IDERobotRuntimeState, MultiRobotEditorRequest } from "@/connections/ideRobotTypes";
 
 const fleet = getRobotFleetManager();
 const appMgr = AppMgr.getInstance();
@@ -26,11 +26,25 @@ function downloadJson(value: unknown, filename: string): void {
   URL.revokeObjectURL(url);
 }
 
-function RuntimeDot({ running }: { running: boolean }) {
+function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
+  const title = state === "idle"
+    ? "Idle"
+    : state === "starting"
+      ? "Preparing program"
+      : state === "stopping"
+        ? "Stopping program"
+        : "Program running";
+  const color = state === "idle"
+    ? "bg-gray-500"
+    : state === "starting"
+      ? "animate-pulse bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.9)]"
+      : state === "stopping"
+        ? "animate-pulse bg-orange-400 shadow-[0_0_8px_rgba(251,146,60,0.9)]"
+        : "animate-pulse bg-yellow-300 shadow-[0_0_8px_rgba(250,204,21,0.9)]";
   return (
     <span
-      title={running ? "Program running" : "Idle"}
-      className={`inline-block h-2.5 w-2.5 rounded-full ${running ? "animate-pulse bg-yellow-300 shadow-[0_0_8px_rgba(250,204,21,0.9)]" : "bg-gray-500"}`}
+      title={title}
+      className={`inline-block h-2.5 w-2.5 rounded-full ${color}`}
     />
   );
 }
@@ -248,7 +262,7 @@ export default function MultiAgentLabWidget() {
           {usbSnapshot.sessions.map((session) => (
             <article key={session.sessionId} className={`rounded border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-gray-500 bg-gray-950"}`}>
               <div className="flex items-center justify-between gap-2">
-                <strong className="flex items-center gap-2"><RuntimeDot running={session.runtimeState === "running"} />{session.alias}</strong>
+                <strong className="flex items-center gap-2"><RuntimeDot state={session.runtimeState} />{session.alias}</strong>
                 <span className={session.state === "connected" ? "text-green-400" : session.state === "error" ? "text-red-400" : "text-yellow-300"}>{session.state}</span>
               </div>
               <dl className="mt-2 grid grid-cols-2 gap-x-2 text-xs text-gray-300">
@@ -284,7 +298,7 @@ export default function MultiAgentLabWidget() {
           {bleIDESnapshot.sessions.map((session) => (
             <article key={session.sessionId} className={`rounded border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-cyan-800 bg-gray-950"}`}>
               <div className="flex items-center justify-between gap-2">
-                <strong className="flex items-center gap-2"><RuntimeDot running={session.runtimeState === "running"} />{session.alias}</strong>
+                <strong className="flex items-center gap-2"><RuntimeDot state={session.runtimeState} />{session.alias}</strong>
                 <span className={session.state === "connected" ? "text-green-400" : session.state === "error" ? "text-red-400" : "text-yellow-300"}>{session.state}</span>
               </div>
               <dl className="mt-2 grid grid-cols-2 gap-x-2 text-xs text-gray-300">

@@ -15,7 +15,11 @@ import GoogleAuthService from '@/services/google-auth';
 import GoogleDriveService from '@/services/google-drive';
 import type { USBRobotFleetSnapshot } from '@/connections/usbFleetTypes';
 import type { BLERobotFleetSnapshot } from '@/connections/bluetoothFleetTypes';
-import type { IDERobotTargetSnapshot } from '@/connections/ideRobotTypes';
+import type {
+    IDERobotRunPreflight,
+    IDERobotRuntimeState,
+    IDERobotTargetSnapshot,
+} from '@/connections/ideRobotTypes';
 
 export enum Themes {
     DARK = 'dark',
@@ -306,7 +310,7 @@ export default class AppMgr {
         return this._connectionMgr?.getActiveRobotSessionId() ?? null;
     }
 
-    public getActiveRobotRuntimeState(): 'idle' | 'running' {
+    public getActiveRobotRuntimeState(): IDERobotRuntimeState {
         return this._connectionMgr?.getActiveRobotRuntimeState() ?? 'idle';
     }
 
@@ -318,8 +322,18 @@ export default class AppMgr {
         return this._connectionMgr?.consumeActiveRobotTerminalBuffer() ?? '';
     }
 
-    public markActiveRobotRuntimeState(runtimeState: 'idle' | 'running'): void {
+    public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {
         this._connectionMgr?.markActiveRobotRuntimeState(runtimeState);
+    }
+
+    public markRobotRuntimeState(sessionId: string, runtimeState: IDERobotRuntimeState): void {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        this._connectionMgr.markRobotRuntimeState(sessionId, runtimeState);
+    }
+
+    public async getRobotRunPreflight(sessionId: string): Promise<IDERobotRunPreflight> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        return this._connectionMgr.getRobotRunPreflight(sessionId);
     }
 
     public async addBluetoothIDERobot(): Promise<void> {

@@ -1,3 +1,5 @@
+import type { IDERobotRuntimeState } from './ideRobotTypes';
+
 export type USBRobotSessionState =
     | 'connecting'
     | 'initializing'
@@ -9,7 +11,7 @@ export interface USBRobotSessionSnapshot {
     sessionId: string;
     alias: string;
     state: USBRobotSessionState;
-    runtimeState: 'idle' | 'running';
+    runtimeState: IDERobotRuntimeState;
     active: boolean;
     usbVendorId?: number;
     usbProductId?: number;

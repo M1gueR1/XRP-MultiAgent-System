@@ -15,7 +15,11 @@ import type {
 } from '@/connections/bluetoothFleetTypes';
 import { CommandToXRPMgr } from './commandstoxrpmgr';
 import PluginMgr from './pluginmgr';
-import type { IDERobotTargetSnapshot } from '@/connections/ideRobotTypes';
+import type {
+    IDERobotRunPreflight,
+    IDERobotRuntimeState,
+    IDERobotTargetSnapshot,
+} from '@/connections/ideRobotTypes';
 import {
     BluetoothIDETransport,
     USBIDETransport,
@@ -23,8 +27,6 @@ import {
     MULTI_AGENT_LIBRARY_FILES,
     programUsesTeamCommunication,
 } from '@/multiagent';
-
-type IDERobotRuntimeState = 'idle' | 'running';
 
 interface USBRobotSessionRecord {
     sessionId: string;
@@ -139,7 +141,7 @@ export default class ConnectionMgr {
             throw new Error('The active XRP is busy. Wait before changing robots.');
         }
         if (sessionId === this.activeUSBSessionId && this.activeConnection === record.connection) {
-            if (record.runtimeState !== 'running') {
+            if (record.runtimeState === 'idle') {
                 await this.refreshFilesystemForRecord(record);
             } else {
                 this.emitCachedFilesystem(record);
@@ -151,7 +153,7 @@ export default class ConnectionMgr {
         try {
             this.activateUSBRecord(record);
             this.appMgr.emit(EventType.EVENT_CONNECTION_STATUS, ConnectionState.Connected.toString());
-            if (record.runtimeState === 'running') {
+            if (record.runtimeState !== 'idle') {
                 this.emitCachedFilesystem(record);
             } else {
                 await this.refreshFilesystemForRecord(record);
@@ -270,7 +272,7 @@ export default class ConnectionMgr {
         try {
             this.activateBLERecord(record);
             this.appMgr.emit(EventType.EVENT_CONNECTION_STATUS, ConnectionState.Connected.toString());
-            if (record.runtimeState === 'running') {
+            if (record.runtimeState !== 'idle') {
                 this.emitCachedFilesystem(record);
             } else {
                 await this.refreshFilesystemForRecord(record);
@@ -376,6 +378,25 @@ export default class ConnectionMgr {
         this.setRobotRuntimeState(active, runtimeState);
     }
 
+    public markRobotRuntimeState(sessionId: string, runtimeState: IDERobotRuntimeState): void {
+        const record = this.getRobotRecord(sessionId);
+        if (!record) throw new Error(`Unknown XRP session: ${sessionId}`);
+        this.setRobotRuntimeState(record, runtimeState);
+    }
+
+    public async getRobotRunPreflight(sessionId: string): Promise<IDERobotRunPreflight> {
+        const record = this.getRobotRecord(sessionId);
+        if (!record) throw new Error(`Unknown XRP session: ${sessionId}`);
+        if (!record.connection.isConnected()) throw new Error(`${record.alias} is disconnected.`);
+        const transport = this.usbSessions.has(sessionId) ? 'usb' : 'bluetooth';
+        return {
+            voltage: await record.commands.batteryVoltage(),
+            isNanoXRP: record.commands.isNanoXRP(),
+            xrpDrive: record.commands.getXRPDrive(),
+            transport,
+        };
+    }
+
     public getConnectedIDERobots(sessionIds?: string[]): IDERobotTargetSnapshot[] {
         const requested = sessionIds ? new Set(sessionIds) : null;
         const usb = [...this.usbSessions.values()]
@@ -405,7 +426,7 @@ export default class ConnectionMgr {
         if (sessionIds.includes(this.getActiveRobotSessionId() ?? '')) {
             const active = this.getActiveRobotRecord();
             if (active) {
-                if (active.runtimeState !== 'running') {
+                if (active.runtimeState === 'idle') {
                     await this.refreshFilesystemForRecord(active);
                 } else {
                     this.emitCachedFilesystem(active);
@@ -420,28 +441,34 @@ export default class ConnectionMgr {
         content: string,
     ): Promise<void> {
         const targets = this.resolveCommandTargets(sessionIds);
-        if (programUsesTeamCommunication(content)) {
-            await this.prepareTeamCommunication(sessionIds);
-        }
-        await Promise.all(targets.map(({ commands }) => commands.uploadFile(path, content, false)));
-        await Promise.all(targets.map(async ({ sessionId, commands }) => {
-            const lines = await commands.updateMainFile(path, false);
+        const records = targets.flatMap(({ sessionId }) => {
             const record = this.getRobotRecord(sessionId);
-            if (record) this.setRobotRuntimeState(record, 'running');
-            try {
-                await commands.executeLines(lines, { refreshFilesystem: false, emitProgramExecuted: false });
-            } finally {
-                if (record) this.setRobotRuntimeState(record, 'idle');
+            return record ? [record] : [];
+        });
+        for (const record of records) this.setRobotRuntimeState(record, 'starting');
+
+        try {
+            if (programUsesTeamCommunication(content)) {
+                await this.prepareTeamCommunication(sessionIds);
             }
-        }));
-        if (sessionIds.includes(this.getActiveRobotSessionId() ?? '')) {
-            const active = this.getActiveRobotRecord();
-            if (active) {
-                if (active.runtimeState !== 'running') {
-                    await this.refreshFilesystemForRecord(active);
-                } else {
-                    this.emitCachedFilesystem(active);
+            await Promise.all(targets.map(({ commands }) => commands.uploadFile(path, content, false)));
+            await Promise.all(targets.map(async ({ sessionId, commands }) => {
+                const lines = await commands.updateMainFile(path, false);
+                const record = this.getRobotRecord(sessionId);
+                if (record) this.setRobotRuntimeState(record, 'running');
+                try {
+                    await commands.executeLines(lines, { refreshFilesystem: false, emitProgramExecuted: false });
+                } finally {
+                    if (record) this.setRobotRuntimeState(record, 'idle');
                 }
+            }));
+            if (sessionIds.includes(this.getActiveRobotSessionId() ?? '')) {
+                const active = this.getActiveRobotRecord();
+                if (active) await this.refreshFilesystemForRecord(active);
+            }
+        } finally {
+            for (const record of records) {
+                if (record.runtimeState !== 'idle') this.setRobotRuntimeState(record, 'idle');
             }
         }
     }
@@ -454,6 +481,10 @@ export default class ConnectionMgr {
             if (bluetooth?.connection.isConnected()) return [{ sessionId, commands: bluetooth.commands }];
             return [];
         });
+        for (const { sessionId } of targets) {
+            const record = this.getRobotRecord(sessionId);
+            if (record) this.setRobotRuntimeState(record, 'stopping');
+        }
         await Promise.all(targets.map(async ({ sessionId, commands }) => {
             try {
                 await commands.stopProgram();
@@ -642,6 +673,7 @@ export default class ConnectionMgr {
             await record.connection.getToNormal();
             await this.cmdToXRPMgr.clearIsRunning();
             this.xrpID = await this.cmdToXRPMgr.checkIfNeedUpdate();
+            record.commands.copyHardwareStateFrom(this.cmdToXRPMgr);
             this.IDSet(ConnectionType.BLUETOOTH);
             await this.pluginMgr.pluginCheck();
             record.initialized = true;
@@ -730,6 +762,7 @@ export default class ConnectionMgr {
             await this.cmdToXRPMgr.resetTerminal();
             await this.cmdToXRPMgr.clearIsRunning();
             this.xrpID = await this.cmdToXRPMgr.checkIfNeedUpdate();
+            record.commands.copyHardwareStateFrom(this.cmdToXRPMgr);
             this.IDSet(ConnectionType.USB);
             await this.pluginMgr.pluginCheck();
             record.initialized = true;
@@ -835,11 +868,14 @@ export default class ConnectionMgr {
     private setRobotRuntimeState(record: IDERobotSessionRecord, runtimeState: IDERobotRuntimeState): void {
         if (record.runtimeState === runtimeState) return;
         record.runtimeState = runtimeState;
-        if (runtimeState === 'running') {
-            record.lastRunStartedAt = Date.now();
+        if (runtimeState === 'starting') {
+            record.lastRunStartedAt = undefined;
             record.lastRunFinishedAt = undefined;
             record.terminalBuffer = '';
-        } else {
+        } else if (runtimeState === 'running') {
+            record.lastRunStartedAt = Date.now();
+            record.lastRunFinishedAt = undefined;
+        } else if (runtimeState === 'idle') {
             record.lastRunFinishedAt = Date.now();
         }
         this.emitUSBFleet();
@@ -852,7 +888,7 @@ export default class ConnectionMgr {
     private broadcastActiveRuntimeState(): void {
         this.appMgr.emit(
             EventType.EVENT_ISRUNNING,
-            this.getActiveRobotRuntimeState() === 'running' ? 'running' : 'stopped',
+            this.getActiveRobotRuntimeState() !== 'idle' ? 'running' : 'stopped',
         );
     }
 

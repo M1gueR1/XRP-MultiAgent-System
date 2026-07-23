@@ -1,3 +1,5 @@
+import type { IDERobotRuntimeState } from './ideRobotTypes';
+
 export type BLERobotSessionState =
     | 'connecting'
     | 'initializing'
@@ -9,7 +11,7 @@ export interface BLERobotSessionSnapshot {
     sessionId: string;
     alias: string;
     state: BLERobotSessionState;
-    runtimeState: 'idle' | 'running';
+    runtimeState: IDERobotRuntimeState;
     active: boolean;
     deviceName?: string;
     browserDeviceId?: string;

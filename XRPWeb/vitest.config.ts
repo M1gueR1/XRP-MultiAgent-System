@@ -2,6 +2,13 @@ import { fileURLToPath } from 'url'
 import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
+  server: {
+    fs: {
+      // MultiAgentLib is intentionally shared with the sibling MicroPython
+      // package and imported as raw source by the browser runtime bundle.
+      allow: [fileURLToPath(new URL('..', import.meta.url))],
+    },
+  },
   test: {
     environment: "jsdom",
     globals: true,

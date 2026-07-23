@@ -134,7 +134,7 @@ function NavBar({ layoutref }: NavBarProps) {
     const activeEditorSession = EditorMgr.getInstance().getEditorSession(activeTab);
     const isMultiRobotMode = Boolean(activeEditorSession?.multiRobotSessionIds?.length);
     const syncActiveRunningState = () => {
-        setRunning(AppMgr.getInstance().getActiveRobotRuntimeState() === 'running');
+        setRunning(AppMgr.getInstance().getActiveRobotRuntimeState() !== 'idle');
     };
 
     // Check for Web Serial API support once on component mount.
@@ -1099,7 +1099,6 @@ function NavBar({ layoutref }: NavBarProps) {
             if (selectedSession?.multiRobotSessionIds?.length) {
                 const sessionIds = selectedSession.multiRobotSessionIds;
                 setRunning(true);
-                broadcastRunningState(true);
                 multiRunSessionIdsRef.current = sessionIds;
                 try {
                     await AppMgr.getInstance().runProgramOnRobots(
@@ -1124,31 +1123,40 @@ function NavBar({ layoutref }: NavBarProps) {
                     multiRunSessionIdsRef.current = [];
                     syncActiveRunningState();
                     setIsStopping(false);
-                    broadcastRunningState(
-                        AppMgr.getInstance().getActiveRobotRuntimeState() === 'running',
-                    );
                 }
                 return;
             }
 
+            const requestedRobotSessionId = AppMgr.getInstance().getActiveRobotSessionId();
             setRunning(true);
-            broadcastRunningState(true);
+            if (requestedRobotSessionId) {
+                AppMgr.getInstance().markRobotRuntimeState(requestedRobotSessionId, 'starting');
+            } else {
+                broadcastRunningState(true);
+            }
 
             // Check battery voltage && version
-            await CommandToXRPMgr.getInstance()
-                .batteryVoltage()
-                .then((voltage) => {
-                    const connectionType = AppMgr.getInstance().getConnectionType();
+            const legacyCommands = CommandToXRPMgr.getInstance();
+            const preflightPromise = requestedRobotSessionId
+                ? AppMgr.getInstance().getRobotRunPreflight(requestedRobotSessionId)
+                : legacyCommands.batteryVoltage().then((voltage) => ({
+                    voltage,
+                    isNanoXRP: legacyCommands.isNanoXRP(),
+                    xrpDrive: legacyCommands.getXRPDrive(),
+                    transport: AppMgr.getInstance().getConnectionType() === ConnectionType.BLUETOOTH
+                        ? 'bluetooth' as const
+                        : 'usb' as const,
+                }));
+            await preflightPromise
+                .then((preflight) => {
                     const beginExecution = async () => {
                         try {
-                            const session: EditorSession | undefined =
-                                EditorMgr.getInstance().getEditorSession(activeTab);
+                            const session: EditorSession | undefined = selectedSession;
                             if (session) {
-                                const activeRobotSessionId = AppMgr.getInstance().getActiveRobotSessionId();
-                                if (activeRobotSessionId) {
+                                if (requestedRobotSessionId) {
                                     try {
                                         await AppMgr.getInstance().runProgramOnRobots(
-                                            [activeRobotSessionId],
+                                            [requestedRobotSessionId],
                                             session.path,
                                             session.content ?? '',
                                         );
@@ -1159,9 +1167,6 @@ function NavBar({ layoutref }: NavBarProps) {
                                         );
                                     } finally {
                                         syncActiveRunningState();
-                                        broadcastRunningState(
-                                            AppMgr.getInstance().getActiveRobotRuntimeState() === 'running',
-                                        );
                                     }
                                     return;
                                 }
@@ -1209,26 +1214,52 @@ function NavBar({ layoutref }: NavBarProps) {
                             }
                         } catch (err) {
                             console.log(err);
+                            if (requestedRobotSessionId) {
+                                AppMgr.getInstance().markRobotRuntimeState(requestedRobotSessionId, 'idle');
+                                syncActiveRunningState();
+                            } else {
+                                broadcastRunningState(false);
+                            }
                         }
                     };
 
                     const handlePowerSwitchOK = async () => {
-                        setRunning(true);
+                        if (
+                            !requestedRobotSessionId ||
+                            AppMgr.getInstance().getActiveRobotSessionId() === requestedRobotSessionId
+                        ) {
+                            setRunning(true);
+                        }
                         toggleDialog();
-                        beginExecution();
+                        void beginExecution();
                     };
 
                     const handlePowerSwitchCancel = () => {
-                        setRunning(false);
-                        broadcastRunningState(false);
+                        if (requestedRobotSessionId) {
+                            AppMgr.getInstance().markRobotRuntimeState(requestedRobotSessionId, 'idle');
+                            syncActiveRunningState();
+                        } else {
+                            setRunning(false);
+                            broadcastRunningState(false);
+                        }
+                        toggleDialog();
+                    };
+                    const handleBatteryBadClose = () => {
+                        if (requestedRobotSessionId) {
+                            AppMgr.getInstance().markRobotRuntimeState(requestedRobotSessionId, 'idle');
+                            syncActiveRunningState();
+                        } else {
+                            setRunning(false);
+                            broadcastRunningState(false);
+                        }
                         toggleDialog();
                     };
 
-                    if (connectionType === ConnectionType.USB) {
-                        if (voltage < 0.45 && !CommandToXRPMgr.getInstance().isNanoXRP()) {
+                    if (preflight.transport === 'usb') {
+                        if (preflight.voltage < 0.45 && !preflight.isNanoXRP) {
                             // display a confirmation message to ask the user to turn on the power switch
                             const powerswitchImage =
-                                CommandToXRPMgr.getInstance().getXRPDrive() ===
+                                preflight.xrpDrive ===
                                 Constants.XRP_PROCESSOR_BETA
                                     ? powerswitch_beta
                                     : powerswitch_standard;
@@ -1241,10 +1272,10 @@ function NavBar({ layoutref }: NavBarProps) {
                             );
                             toggleDialog();
                         } else {
-                            beginExecution();
+                            void beginExecution();
                         }
-                    } else if (connectionType === ConnectionType.BLUETOOTH) {
-                        if (voltage < 0.45 && !CommandToXRPMgr.getInstance().isNanoXRP()) {
+                    } else {
+                        if (preflight.voltage < 0.45 && !preflight.isNanoXRP) {
                             // display a confirmation message to ask the user to turn on the power switch
                             //this one will only happen if they are using a power device plugged into the USB port and the power switch is off.
                             setDialogContent(
@@ -1254,13 +1285,29 @@ function NavBar({ layoutref }: NavBarProps) {
                                 />,
                             );
                             toggleDialog();
-                        } else if (voltage < (CommandToXRPMgr.getInstance().isNanoXRP() ? 3.6 : 5.0)) {
-                            setDialogContent(<BatteryBadDlg cancelCallback={toggleDialog} />);
+                        } else if (preflight.voltage < (preflight.isNanoXRP ? 3.6 : 5.0)) {
+                            setDialogContent(<BatteryBadDlg cancelCallback={handleBatteryBadClose} />);
                             toggleDialog();
                         } else {
-                            beginExecution();
+                            void beginExecution();
                         }
                     }
+                })
+                .catch((error) => {
+                    if (requestedRobotSessionId) {
+                        AppMgr.getInstance().markRobotRuntimeState(requestedRobotSessionId, 'idle');
+                        syncActiveRunningState();
+                    } else {
+                        setRunning(false);
+                        broadcastRunningState(false);
+                    }
+                    setDialogContent(
+                        <AlertDialog
+                            alertMessage={error instanceof Error ? error.message : String(error)}
+                            toggleDialog={toggleDialog}
+                        />,
+                    );
+                    if (!dialogRef.current?.open) dialogRef.current?.showModal();
                 });
         } else {
             if (multiRunSessionIdsRef.current.length > 0) {
@@ -1280,7 +1327,7 @@ function NavBar({ layoutref }: NavBarProps) {
             }
             setIsStopping(true);
             const activeRobotSessionId = AppMgr.getInstance().getActiveRobotSessionId();
-            if (activeRobotSessionId && AppMgr.getInstance().getActiveRobotRuntimeState() === 'running') {
+            if (activeRobotSessionId && AppMgr.getInstance().getActiveRobotRuntimeState() !== 'idle') {
                 void AppMgr.getInstance().stopProgramsOnRobots([activeRobotSessionId]).finally(() => {
                     setRunning(false);
                     setIsStopping(false);
