@@ -365,11 +365,13 @@ export default class ConnectionMgr {
     }
 
     public consumeActiveRobotTerminalBuffer(): string {
+        return this.getActiveRobotTerminalBuffer();
+    }
+
+    public appendActiveRobotTerminalBuffer(data: string): void {
         const active = this.getActiveRobotRecord();
-        if (!active) return '';
-        const buffer = active.terminalBuffer;
-        active.terminalBuffer = '';
-        return buffer;
+        if (!active || !data) return;
+        this.appendTerminalBuffer(active, data);
     }
 
     public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {

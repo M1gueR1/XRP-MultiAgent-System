@@ -10,6 +10,38 @@ function deferred() {
 }
 
 describe('ConnectionMgr session-bound runs', () => {
+    it('keeps terminal history available across repeated IDE switches', async () => {
+        const first = {
+            sessionId: 'usb-b',
+            alias: 'XRP B',
+            connection: { isConnected: () => true },
+            state: 'connected',
+            runtimeState: 'running',
+            initialized: true,
+            terminalBuffer: 'Receiver ready\r\n',
+            commands: {},
+            multiAgentLibraryInstalled: true,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map([[first.sessionId, first]]),
+            bleSessions: new Map(),
+            activeUSBSessionId: first.sessionId,
+            activeBLESessionId: null,
+            activeConnection: first.connection,
+        });
+
+        expect(manager.consumeActiveRobotTerminalBuffer()).toBe('Receiver ready\r\n');
+        expect(manager.consumeActiveRobotTerminalBuffer()).toBe('Receiver ready\r\n');
+
+        manager.appendActiveRobotTerminalBuffer('Message received: Hiiii from A\r\n');
+
+        expect(manager.consumeActiveRobotTerminalBuffer()).toContain('Receiver ready');
+        expect(manager.consumeActiveRobotTerminalBuffer()).toContain('Message received: Hiiii from A');
+    });
+
     it('keeps a pending receiver on its original robot while a sender starts in the newly active IDE', async () => {
         const upload = deferred();
         const firstCommands = {

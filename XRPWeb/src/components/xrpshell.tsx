@@ -92,6 +92,7 @@ function XRPShell() {
 
         if (instance) {
             const writeAndCapture = (data: string) => {
+                appMgr.appendActiveRobotTerminalBuffer(data);
                 instance.write(data);
                 setTimeout(() => {
                     const content = captureTerminalContent(instance);

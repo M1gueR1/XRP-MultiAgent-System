@@ -322,6 +322,10 @@ export default class AppMgr {
         return this._connectionMgr?.consumeActiveRobotTerminalBuffer() ?? '';
     }
 
+    public appendActiveRobotTerminalBuffer(data: string): void {
+        this._connectionMgr?.appendActiveRobotTerminalBuffer(data);
+    }
+
     public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {
         this._connectionMgr?.markActiveRobotRuntimeState(runtimeState);
     }
