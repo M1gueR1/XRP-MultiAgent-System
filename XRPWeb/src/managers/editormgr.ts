@@ -59,6 +59,8 @@ export type EditorStore = {
     isBlockly: boolean;
     isSavedToXRP: boolean;
     content: string;
+    robotSessionId?: string | null;
+    multiRobotSessionIds?: string[];
 };
 
 /**
@@ -413,6 +415,8 @@ export default class EditorMgr {
             isBlockly: session.type === EditorType.BLOCKLY,
             isSavedToXRP: !session.isModified,
             content: code,
+            robotSessionId: session.robotSessionId,
+            multiRobotSessionIds: session.multiRobotSessionIds,
         };
         // Update the session content with the new code
         session.content = code;

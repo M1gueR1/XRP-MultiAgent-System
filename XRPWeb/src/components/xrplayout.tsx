@@ -223,6 +223,8 @@ function XRPLayout({ forwardedref }: XRPLayoutProps) {
                         gpath: store.gpath,
                         filetype: store.isBlockly ? FileType.BLOCKLY : FileType.PYTHON,
                         content: store.content,
+                        robotSessionId: store.robotSessionId,
+                        multiRobotSessionIds: store.multiRobotSessionIds,
                     }
                     CreateEditorTab(fileData, layoutRef);
                     let content: string | undefined;
@@ -232,7 +234,12 @@ function XRPLayout({ forwardedref }: XRPLayoutProps) {
                     } else {
                         content = store.content;
                     }
-                    const loadContent = { name: store.name, path: store.path, content: content };
+                    const loadContent = {
+                        name: store.name,
+                        path: store.path,
+                        content,
+                        robotSessionId: store.robotSessionId,
+                    };
                     AppMgr.getInstance().emit(EventType.EVENT_EDITOR_LOAD, JSON.stringify(loadContent));
                     if (!store.isSavedToXRP) {
                         // update the editor session and update the tab dirty status

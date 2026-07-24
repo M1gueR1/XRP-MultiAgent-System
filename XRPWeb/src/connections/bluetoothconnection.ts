@@ -1,8 +1,9 @@
-import ConnectionMgr from '@/managers/connectionmgr';
+import type ConnectionMgr from '@/managers/connectionmgr';
 import { ConnectionType } from '@/utils/types';
 import Connection, { ConnectionState } from '@connections/connection';
 import TableMgr from '@/managers/tablemgr';
 import AppMgr, { EventType } from '@/managers/appmgr';
+import { encodeUSBTeamFrame, USBTeamFrameParser } from '@/multiagent/transport/USBSerialTeamFraming';
 
 /**
  * BluetoothConnection class
@@ -44,7 +45,12 @@ export class BluetoothConnection extends Connection {
     private disconnectGeneration: number = 0;
     private readonly runtimeDataListeners = new Set<(data: Uint8Array) => void>();
     private readonly runtimeDisconnectedListeners = new Set<() => void>();
-    private runtimeWriteQueue: Promise<void> = Promise.resolve();
+    private gattWriteQueue: Promise<void> = Promise.resolve();
+    private readonly runtimeUARTFrameParser = new USBTeamFrameParser();
+    private readonly maximumWriteAttempts = 3;
+    // Twenty bytes works with the default BLE ATT MTU used by both XRP
+    // firmware generations. MultiAgentLib's stream parser reassembles frames.
+    private readonly runtimeWriteChunkSize = 20;
 
     private  Table: TableMgr | undefined = undefined;
 
@@ -208,7 +214,9 @@ export class BluetoothConnection extends Connection {
             while (this.connectionStates === ConnectionState.Connected) {
                     let values: Uint8Array | undefined = undefined;
                     values = await this.getBLEData();
-                    this.readData(values);
+                    if (values) {
+                        this.processRuntimeUARTData(values);
+                    }
                 
                     let valuesD: Uint8Array | undefined = undefined;
                     if(this.bleDataReader != undefined){
@@ -296,6 +304,7 @@ export class BluetoothConnection extends Connection {
         this.connectionStates = ConnectionState.Busy;
         this.manualDisconnect = false;
         this.disconnectNotified = false;
+        let gattReady = false;
         try {
             const device = await navigator.bluetooth.requestDevice({
                 filters: [{ namePrefix: 'XRP' }],
@@ -312,9 +321,27 @@ export class BluetoothConnection extends Connection {
             const server = await device.gatt.connect();
             await this.discoverCharacteristics(server);
             this.attachDisconnectListener(device);
+            gattReady = true;
             this.reconnectSuccess = true;
             await this.onConnected();
         } catch (error) {
+            const keepPhysicalConnection =
+                gattReady &&
+                this.bleDevice?.gatt?.connected === true &&
+                this.bleWriter !== undefined &&
+                this.bleReader !== undefined;
+            if (keepPhysicalConnection) {
+                this.connectionStates = ConnectionState.Connected;
+                this.manualDisconnect = false;
+                AppMgr.getInstance().emit(
+                    EventType.EVENT_HIDE_BLUETOOTH_CONNECTING,
+                    'hide-bluetooth-connecting',
+                );
+                throw new Error(
+                    `BLE IDE initialization failed: ${error instanceof Error ? error.message : String(error)}. ` +
+                    'The Bluetooth link is still connected; use Reconnect on this XRP to retry initialization.',
+                );
+            }
             this.connectionStates = ConnectionState.Disconnected;
             this.manualDisconnect = true;
             if (this.bleDevice?.gatt?.connected) this.bleDevice.gatt.disconnect();
@@ -394,6 +421,10 @@ export class BluetoothConnection extends Connection {
     }
 
     public hasRuntimeDataChannel(): boolean {
+        return this.isConnected() && this.bleWriter !== undefined;
+    }
+
+    public hasDedicatedRuntimeDataChannel(): boolean {
         return this.bleDataReader !== undefined && this.bleDataWriter !== undefined;
     }
 
@@ -407,22 +438,46 @@ export class BluetoothConnection extends Connection {
         return () => this.runtimeDisconnectedListeners.delete(listener);
     }
 
-    public async writeRuntimeData(data: Uint8Array): Promise<void> {
-        if (!this.isConnected() || !this.bleDataWriter) {
-            throw new Error('The XRP Bluetooth DATA channel is not connected.');
+    private processRuntimeUARTData(values: Uint8Array): void {
+        const runtimeFrames = this.runtimeUARTFrameParser.push(values);
+        for (const packet of runtimeFrames.packets) {
+            for (const listener of this.runtimeDataListeners) listener(packet);
         }
-        this.runtimeWriteQueue = this.runtimeWriteQueue.then(async () => {
+        if (runtimeFrames.regularData.length > 0) {
+            this.readData(runtimeFrames.regularData);
+        }
+    }
+
+    public async writeRuntimeData(data: Uint8Array): Promise<void> {
+        if (!this.hasRuntimeDataChannel()) {
+            throw new Error('The XRP Bluetooth runtime channel is not connected.');
+        }
+        if (!this.bleDataWriter) {
+            // Older XRP firmware has only the BLE UART characteristics. During
+            // a running program that UART behaves like stdin/stdout, so reuse
+            // the same ASCII-safe framing proven by the USB transport.
+            await this.bleQueue(encodeUSBTeamFrame(data));
+            return;
+        }
+        await this.enqueueGattWrite(async () => {
             if (!this.bleDataWriter) throw new Error('The XRP Bluetooth DATA writer is unavailable.');
-            if (
-                this.bleDataWriter.properties.writeWithoutResponse &&
-                typeof this.bleDataWriter.writeValueWithoutResponse === 'function'
-            ) {
-                await this.bleDataWriter.writeValueWithoutResponse(data as BufferSource);
-            } else {
-                await this.bleDataWriter.writeValue(data as BufferSource);
+            for (let offset = 0; offset < data.length; offset += this.runtimeWriteChunkSize) {
+                const chunk = data.slice(offset, offset + this.runtimeWriteChunkSize);
+                await this.writeWithRetry(async () => {
+                    if (!this.bleDataWriter) {
+                        throw new Error('The XRP Bluetooth DATA writer is unavailable.');
+                    }
+                    if (
+                        this.bleDataWriter.properties.writeWithoutResponse &&
+                        typeof this.bleDataWriter.writeValueWithoutResponse === 'function'
+                    ) {
+                        await this.bleDataWriter.writeValueWithoutResponse(chunk as BufferSource);
+                    } else {
+                        await this.bleDataWriter.writeValue(chunk as BufferSource);
+                    }
+                }, 'Bluetooth DATA');
             }
         });
-        await this.runtimeWriteQueue;
     }
 
     private str2ab(str: string): ArrayBuffer {
@@ -438,17 +493,13 @@ export class BluetoothConnection extends Connection {
      */
     public async writeToDevice(str: string | Uint8Array) {
         this.connLogger.debug('writeToDevice BLE: ' + str);
-
-        try {
-            if (typeof str == 'string') {
-                //this.connLogger.debug("writing: " + str);
-                await this.bleQueue(this.str2ab(str));
-            } else {
-                //this.connLogger.debug("writing: " + this.TEXT_DECODER.decode(str));
-                await this.bleQueue(str as BufferSource);
-            }
-        } catch (error) {
-            this.connLogger.debug(error);
+        if (!this.isConnected() || !this.bleWriter) {
+            throw new Error('The XRP Bluetooth REPL channel is not connected.');
+        }
+        if (typeof str == 'string') {
+            await this.bleQueue(this.str2ab(str));
+        } else {
+            await this.bleQueue(str as BufferSource);
         }
     }
 
@@ -472,16 +523,63 @@ export class BluetoothConnection extends Connection {
      *  bleQueue - If we haven't come back from the ble.writeValue then the GATT is still busy and we will miss items that are being sent
      * This can be seen if you type very fast in the Shell 
      */
-    private Queue:Promise<void> = Promise.resolve();
-    private async  bleQueue(value: BufferSource){
-        this.Queue = this.Queue.then(async () => {
-            try {
-                await this.bleWriter?.writeValue(value);
-            } catch (error) {
-                console.error('ble write failed:', error);
+    private async bleQueue(value: BufferSource) {
+        await this.enqueueGattWrite(async () => {
+            if (!this.bleWriter) {
+                throw new Error('The XRP Bluetooth REPL writer is unavailable.');
             }
+            await this.writeWithRetry(
+                () => this.bleWriter!.writeValue(value),
+                'Bluetooth REPL',
+            );
         });
-        await this.Queue;
+    }
+
+    private async enqueueGattWrite(operation: () => Promise<void>): Promise<void> {
+        const write = this.gattWriteQueue.catch(() => undefined).then(operation);
+        this.gattWriteQueue = write.catch(() => undefined);
+        await write;
+    }
+
+    private async writeWithRetry(
+        operation: () => Promise<void>,
+        channel: string,
+    ): Promise<void> {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= this.maximumWriteAttempts; attempt += 1) {
+            try {
+                await operation();
+                return;
+            } catch (error) {
+                lastError = error;
+                if (
+                    attempt >= this.maximumWriteAttempts ||
+                    !this.isTransientWriteError(error)
+                ) {
+                    break;
+                }
+                await new Promise((resolve) => setTimeout(resolve, attempt * 75));
+            }
+        }
+        const detail = lastError instanceof Error ? lastError.message : String(lastError);
+        throw new Error(
+            `${channel} write failed after ${this.maximumWriteAttempts} attempts: ${detail}`,
+        );
+    }
+
+    private isTransientWriteError(error: unknown): boolean {
+        const name = error instanceof DOMException
+            ? error.name
+            : error instanceof Error
+                ? error.name
+                : '';
+        const detail = error instanceof Error ? error.message : String(error);
+        return (
+            name === 'NetworkError' ||
+            name === 'OperationError' ||
+            name === 'UnknownError' ||
+            /gatt.*(?:failed|busy|progress)|temporar|network/i.test(detail)
+        );
     }
 
     public async getToREPL():Promise<boolean>{

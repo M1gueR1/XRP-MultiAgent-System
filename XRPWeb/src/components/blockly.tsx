@@ -3,13 +3,13 @@ import { registerFieldColour } from '@blockly/field-colour';
 import { BlocklyWorkspace, Workspace } from 'react-blockly';
 import BlocklyConfigs from '@components/blockly/xrp_blockly_configs';
 import * as Blockly from 'blockly/core';
+import { blocklyToPython } from '@components/blockly/blocklyCodegen';
 import { setBlocklyLocale } from '@/utils/blockly-locales';
 import AppMgr, { EventType, Themes } from '@/managers/appmgr';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useHotkeys } from 'react-hotkeys-hook';
 import { StorageKeys } from '@/utils/localstorage';
 import EditorMgr, { EditorSession } from '@/managers/editormgr';
-import moment from 'moment';
 import { EditorType } from '@/utils/types';
 
 registerFieldColour(); //Plugin needs to be registered. Used for the Color LED on the non beta board. 
@@ -127,23 +127,6 @@ interface BlocklyEditorProps {
 }
 
 /**
- * blocklyToPython
- * @param ws
- * @returns
- */
-function blocklyToPython(ws: Workspace) {
-    const pythonCode = pythonGenerator
-        .workspaceToCode(ws)
-        .replace('from numbers import Number\n', 'Number = int\n');
-    const blocklyCode = JSON.stringify(Blockly.serialization.workspaces.save(ws));
-    const date = moment();
-    const formatedDate = date.format('YYYY-MM-DD HH:MM:SS');
-    const code = pythonCode + '\n\n\n## ' + formatedDate + '\n##XRPBLOCKS ' + blocklyCode;
-    return code;
-}
-
-
-/**
  * BlocklyEditor component
  * @returns
  */
@@ -223,12 +206,18 @@ function BlocklyEditor({ tabId, tabName }: BlocklyEditorProps) {
                 const session: EditorSession | undefined =
                     EditorMgr.getInstance().getEditorSession(tabId);
                 if (loadContent.name !== nameRef.current || loadContent.path !== session?.path) return;
+                if (
+                    loadContent.robotSessionId !== undefined &&
+                    loadContent.robotSessionId !== session?.robotSessionId
+                ) return;
                 const ws = session?.workspace;
                 if (ws && session?.hasBeenLoaded !== true) {
+                    let generatedCode: string | undefined;
                     try {
                         Blockly.Events.disable();
                         Blockly.serialization.workspaces.load(JSON.parse(loadContent.content), ws);
                         session.hasBeenLoaded = true;
+                        generatedCode = blocklyToPython(ws);
                         // @ts-expect-error - it is a valid function
                         ws.scrollCenter();
                         // @ts-expect-error - it is a valid function
@@ -236,9 +225,11 @@ function BlocklyEditor({ tabId, tabName }: BlocklyEditorProps) {
                     } finally {
                         Blockly.Events.enable();
                     }
-                }
-                if (session) {
-                    EditorMgr.getInstance().SaveToLocalStorage(session, loadContent.content);
+                    if (generatedCode) {
+                        EditorMgr.getInstance().SaveToLocalStorage(session, generatedCode);
+                    }
+                } else if (session?.content?.includes('##XRPBLOCKS ')) {
+                    EditorMgr.getInstance().SaveToLocalStorage(session, session.content);
                 }
                 setIsLoading(false);
                 isLoadingRef.current = false;

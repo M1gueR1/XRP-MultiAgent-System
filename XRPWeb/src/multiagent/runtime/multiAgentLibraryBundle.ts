@@ -25,6 +25,26 @@ export const MULTI_AGENT_LIBRARY_FILES: ReadonlyArray<{
   { path: '/lib/MultiAgentLib/team.py', content: team },
 ];
 
+function bundleFingerprint(): string {
+  const encoder = new TextEncoder();
+  let hash = 0x811c9dc5;
+  for (const file of MULTI_AGENT_LIBRARY_FILES) {
+    const bytes = encoder.encode(`${file.path}\0${file.content}\0`);
+    for (const byte of bytes) {
+      hash ^= byte;
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+  }
+  return hash.toString(16).padStart(8, '0');
+}
+
+const bundleVersion = bundleFingerprint();
+
+export const MULTI_AGENT_LIBRARY_MANIFEST = {
+  path: `/lib/MultiAgentLib/.xrp-bundle-${bundleVersion}`,
+  content: `${bundleVersion}\n`,
+} as const;
+
 export function programUsesTeamCommunication(content: string): boolean {
   return /\bMultiAgentLib(?:\.|\b)|\bxrpTeam\b/.test(content);
 }

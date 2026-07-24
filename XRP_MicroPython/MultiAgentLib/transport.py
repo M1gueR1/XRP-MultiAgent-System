@@ -46,24 +46,33 @@ class MultiAgentTransport:
         if mode == "bluetooth":
             self.attach_existing_ble()
             return
+        if mode == "bluetooth_uart":
+            self.attach_existing_stream("Bluetooth UART")
+            return
         raise RuntimeError("unsupported multi-agent transport: " + mode)
 
     def attach_existing_ble(self):
         module = sys.modules.get("ble.blerepl")
         uart = getattr(module, "uart", None) if module is not None else None
-        if uart is None:
-            raise RuntimeError("ble.blerepl is not active; Bluetooth was not started by MultiAgentLib")
-        write_data = getattr(uart, "write_data", None)
-        set_callback = getattr(uart, "set_data_callback", None)
-        if not callable(write_data) or not callable(set_callback):
-            raise RuntimeError("active XRP BLE firmware lacks the dedicated DATA API")
-        self._writer = write_data
-        set_callback(self._on_data_irq)
-        self._attached = True
+        if uart is not None:
+            write_data = getattr(uart, "write_data", None)
+            set_callback = getattr(uart, "set_data_callback", None)
+            if callable(write_data) and callable(set_callback):
+                self._writer = write_data
+                set_callback(self._on_data_irq)
+                self._attached = True
+                return
+        # Older XRP firmware exposes only the BLE REPL UART. The browser
+        # multiplexes ASCII-safe team frames over that existing stdin/stdout
+        # stream, so no user program or second Bluetooth connection is needed.
+        self.attach_existing_stream("Bluetooth UART")
 
     def attach_existing_usb(self):
+        self.attach_existing_stream("USB")
+
+    def attach_existing_stream(self, transport_name):
         if select is None:
-            raise RuntimeError("USB team messaging requires select.poll")
+            raise RuntimeError(transport_name + " team messaging requires select.poll")
         reader = getattr(sys.stdin, "buffer", sys.stdin)
         writer = sys.stdout
         poller = select.poll()

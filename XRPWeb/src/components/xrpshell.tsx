@@ -91,14 +91,30 @@ function XRPShell() {
         let handleShell: ((data: string) => void) | undefined;
 
         if (instance) {
-            const writeAndCapture = (data: string) => {
-                appMgr.appendActiveRobotTerminalBuffer(data);
+            const writeTerminal = (data: string) => {
                 instance.write(data);
                 setTimeout(() => {
                     const content = captureTerminalContent(instance);
                     const lineCount = instance.buffer?.active?.length || 0;
                     TerminalMgr.updateLiveTerminalContent(TERMINAL_ID, content, lineCount);
                 }, 10);
+            };
+
+            const bindActiveConnection = () => {
+                const activeConn: Connection | null = appMgr.getConnection();
+                if (!activeConn) return;
+                const boundSessionId = appMgr.getActiveRobotSessionId();
+                activeConn.onData = (data: string) => {
+                    if (boundSessionId) {
+                        appMgr.appendRobotTerminalBuffer(boundSessionId, data);
+                    } else {
+                        appMgr.appendActiveRobotTerminalBuffer(data);
+                    }
+                    const isStillActive =
+                        appMgr.getConnection() === activeConn &&
+                        appMgr.getActiveRobotSessionId() === boundSessionId;
+                    if (isStillActive) writeTerminal(data);
+                };
             };
 
             const darkTheme = { foreground: '#ddd', background: '#333333', cursor: '#ddd' };
@@ -130,10 +146,7 @@ function XRPShell() {
                     if (bufferedOutput) {
                         instance.write(bufferedOutput);
                     }
-                    const activeConn: Connection | null = appMgr.getConnection();
-                    if (activeConn != null) {
-                        activeConn.onData = writeAndCapture;
-                    }
+                    bindActiveConnection();
                 } else if (state === ConnectionState.Disconnected.toString()) {
                     instance?.clear();
                     instance?.writeln(t('disconnectXterm'));
@@ -149,16 +162,16 @@ function XRPShell() {
                 }
             };
 
-            handleShell = writeAndCapture;
+            handleShell = (data: string) => {
+                appMgr.appendActiveRobotTerminalBuffer(data);
+                writeTerminal(data);
+            };
             appMgr.on(EventType.EVENT_THEME, handleTheme);
             appMgr.on(EventType.EVENT_CONNECTION_STATUS, handleConnectionStatus);
             appMgr.on(EventType.EVENT_SHELL, handleShell);
 
             if (appMgr.getConnection() != null) {
-                const activeConn: Connection | null = appMgr.getConnection();
-                if (activeConn != null) {
-                    activeConn.onData = writeAndCapture;
-                }
+                bindActiveConnection();
                 // can only be subscribed to once
                 if (!listenerRef.current) {
                     listenerRef.current = instance?.onData((data) => {

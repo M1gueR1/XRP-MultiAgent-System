@@ -25,6 +25,7 @@ import {
     USBIDETransport,
     getRobotFleetManager,
     MULTI_AGENT_LIBRARY_FILES,
+    MULTI_AGENT_LIBRARY_MANIFEST,
     programUsesTeamCommunication,
 } from '@/multiagent';
 
@@ -44,6 +45,7 @@ interface USBRobotSessionRecord {
     error?: string;
     commands: CommandToXRPMgr;
     multiAgentLibraryInstalled: boolean;
+    teamTransportConfigured: boolean;
 }
 
 interface BLERobotSessionRecord {
@@ -63,6 +65,7 @@ interface BLERobotSessionRecord {
     error?: string;
     commands: CommandToXRPMgr;
     multiAgentLibraryInstalled: boolean;
+    teamTransportConfigured: boolean;
 }
 
 type IDERobotSessionRecord = USBRobotSessionRecord | BLERobotSessionRecord;
@@ -374,6 +377,12 @@ export default class ConnectionMgr {
         this.appendTerminalBuffer(active, data);
     }
 
+    public appendRobotTerminalBuffer(sessionId: string, data: string): void {
+        const record = this.getRobotRecord(sessionId);
+        if (!record || !data) return;
+        this.appendTerminalBuffer(record, data);
+    }
+
     public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {
         const active = this.getActiveRobotRecord();
         if (!active) return;
@@ -447,15 +456,38 @@ export default class ConnectionMgr {
             const record = this.getRobotRecord(sessionId);
             return record ? [record] : [];
         });
-        for (const record of records) this.setRobotRuntimeState(record, 'starting');
+        for (const record of records) {
+            record.error = undefined;
+            this.setRobotRuntimeState(record, 'starting');
+        }
 
+        let phase = 'preparing the run';
         try {
-            if (programUsesTeamCommunication(content)) {
+            const usesTeamCommunication = programUsesTeamCommunication(content);
+            if (usesTeamCommunication) {
+                phase = 'checking the team communication library';
                 await this.prepareTeamCommunication(sessionIds);
             }
+            phase = `uploading ${path}`;
             await Promise.all(targets.map(({ commands }) => commands.uploadFile(path, content, false)));
-            await Promise.all(targets.map(async ({ sessionId, commands }) => {
-                const lines = await commands.updateMainFile(path, false);
+            const programByteLength = new TextEncoder().encode(content).length;
+            phase = `verifying ${path}`;
+            await Promise.all(targets.map(({ commands }) => commands.verifyUploadedFiles([{
+                path,
+                byteLength: programByteLength,
+            }])));
+            phase = 'preparing the XRP launch file';
+            const executionPlans = await Promise.all(targets.map(async ({ sessionId, commands }) => ({
+                sessionId,
+                commands,
+                lines: await commands.updateMainFile(path, false),
+            })));
+            if (usesTeamCommunication) {
+                phase = 'starting the team coordinator';
+                await this.prepareTeamRuntime(sessionIds);
+            }
+            phase = `executing ${path}`;
+            await Promise.all(executionPlans.map(async ({ sessionId, commands, lines }) => {
                 const record = this.getRobotRecord(sessionId);
                 if (record) this.setRobotRuntimeState(record, 'running');
                 try {
@@ -465,9 +497,18 @@ export default class ConnectionMgr {
                 }
             }));
             if (sessionIds.includes(this.getActiveRobotSessionId() ?? '')) {
+                phase = 'refreshing the XRP filesystem';
                 const active = this.getActiveRobotRecord();
                 if (active) await this.refreshFilesystemForRecord(active);
             }
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const aliases = records.map((record) => record.alias).join(', ') || 'XRP';
+            const message = `${aliases} Run failed while ${phase}: ${detail}`;
+            for (const record of records) record.error = message;
+            this.emitUSBFleet();
+            this.emitBLEFleet();
+            throw new Error(message);
         } finally {
             for (const record of records) {
                 if (record.runtimeState !== 'idle') this.setRobotRuntimeState(record, 'idle');
@@ -545,26 +586,88 @@ export default class ConnectionMgr {
             bluetoothRecords.push(bluetooth);
         }
 
-        await Promise.all([...usbRecords, ...bluetoothRecords].map(async (record) => {
+        const encoder = new TextEncoder();
+        const libraryFileSizes = MULTI_AGENT_LIBRARY_FILES.map((file) => ({
+            path: file.path,
+            byteLength: encoder.encode(file.content).length,
+        }));
+        const manifestFile = {
+            path: MULTI_AGENT_LIBRARY_MANIFEST.path,
+            byteLength: encoder.encode(MULTI_AGENT_LIBRARY_MANIFEST.content).length,
+        };
+
+        const plans: Array<{
+            record: IDERobotSessionRecord;
+            transportMode: 'usb' | 'bluetooth' | 'bluetooth_uart';
+        }> = [
+            ...usbRecords.map((record) => ({
+                record,
+                transportMode: 'usb' as const,
+            })),
+            ...bluetoothRecords.map((record) => ({
+                record,
+                transportMode: record.connection.hasDedicatedRuntimeDataChannel()
+                    ? 'bluetooth' as const
+                    : 'bluetooth_uart' as const,
+            })),
+        ];
+
+        await Promise.all(plans.map(async ({ record, transportMode }) => {
+            const transportPath = '/lib/MultiAgentLib/_transport_config.py';
+            const transportContent = `TRANSPORT = "${transportMode}"\n`;
+            const transportFile = {
+                path: transportPath,
+                byteLength: encoder.encode(transportContent).length,
+            };
+
             if (!record.multiAgentLibraryInstalled) {
-                for (const file of MULTI_AGENT_LIBRARY_FILES) {
-                    await record.commands.uploadFile(file.path, file.content, false);
+                try {
+                    await record.commands.verifyUploadedFiles([manifestFile]);
+                    record.multiAgentLibraryInstalled = true;
+                } catch {
+                    await record.commands.uploadFileBatch(
+                        [
+                            ...MULTI_AGENT_LIBRARY_FILES.map((file) => ({
+                                path: file.path,
+                                content: file.content,
+                            })),
+                            {
+                                path: MULTI_AGENT_LIBRARY_MANIFEST.path,
+                                content: MULTI_AGENT_LIBRARY_MANIFEST.content,
+                            },
+                            {
+                                path: transportPath,
+                                content: transportContent,
+                            },
+                        ],
+                    );
+                    await record.commands.verifyUploadedFiles([
+                        ...libraryFileSizes,
+                        manifestFile,
+                        transportFile,
+                    ]);
+                    record.multiAgentLibraryInstalled = true;
+                    record.teamTransportConfigured = true;
                 }
-                record.multiAgentLibraryInstalled = true;
+            }
+            if (!record.teamTransportConfigured) {
+                await record.commands.uploadFile(transportPath, transportContent, false);
+                await record.commands.verifyUploadedFiles([transportFile]);
+                record.teamTransportConfigured = true;
             }
         }));
+    }
 
-        await Promise.all(usbRecords.map((record) => record.commands.uploadFile(
-            '/lib/MultiAgentLib/_transport_config.py',
-            'TRANSPORT = "usb"\n',
-            false,
-        )));
-        await Promise.all(bluetoothRecords.map((record) => record.commands.uploadFile(
-            '/lib/MultiAgentLib/_transport_config.py',
-            'TRANSPORT = "bluetooth"\n',
-            false,
-        )));
-
+    private async prepareTeamRuntime(sessionIds: string[]): Promise<void> {
+        const uniqueIds = [...new Set(sessionIds)];
+        const usbRecords = uniqueIds.flatMap((sessionId) => {
+            const record = this.usbSessions.get(sessionId);
+            return record ? [record] : [];
+        });
+        const bluetoothRecords = uniqueIds.flatMap((sessionId) => {
+            const record = this.bleSessions.get(sessionId);
+            return record ? [record] : [];
+        });
         const fleet = getRobotFleetManager();
         await Promise.all(usbRecords.map((record) => fleet.attachExternalRobot(
             this.runtimeExternalKey('usb', record.sessionId),
@@ -666,25 +769,32 @@ export default class ConnectionMgr {
         this.activateBLERecord(record);
         this.emitBLEFleet();
 
+        let phase = 'entering the MicroPython REPL';
         try {
             if (!(await record.connection.getToREPL())) {
                 throw new Error('The XRP did not enter the Bluetooth MicroPython REPL. Reset it and try again.');
             }
             this.appMgr.emit(EventType.EVENT_CONNECTION_STATUS, ConnectionState.Connected.toString());
+            phase = 'reading the XRP filesystem';
             await this.refreshFilesystemForRecord(record);
+            phase = 'restoring the normal MicroPython prompt';
             await record.connection.getToNormal();
+            phase = 'clearing the previous run state';
             await this.cmdToXRPMgr.clearIsRunning();
+            phase = 'checking the XRP firmware';
             this.xrpID = await this.cmdToXRPMgr.checkIfNeedUpdate();
             record.commands.copyHardwareStateFrom(this.cmdToXRPMgr);
             this.IDSet(ConnectionType.BLUETOOTH);
+            phase = 'checking installed plugins';
             await this.pluginMgr.pluginCheck();
             record.initialized = true;
             record.resumeActive = false;
             record.state = 'connected';
         } catch (error) {
             record.state = 'error';
-            record.error = error instanceof Error ? error.message : String(error);
-            throw error;
+            const detail = error instanceof Error ? error.message : String(error);
+            record.error = `${phase} failed: ${detail}`;
+            throw new Error(record.error);
         } finally {
             this.appMgr.emit(EventType.EVENT_HIDE_BLUETOOTH_CONNECTING, 'hide-bluetooth-connecting');
             this.emitBLEFleet();
@@ -726,6 +836,7 @@ export default class ConnectionMgr {
             terminalBuffer: '',
             commands: this.createSessionCommandManager(connection),
             multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
         };
         this.bleSessions.set(record.sessionId, record);
         return record;
@@ -811,6 +922,7 @@ export default class ConnectionMgr {
             terminalBuffer: '',
             commands: this.createSessionCommandManager(connection),
             multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
         };
         this.usbSessions.set(record.sessionId, record);
         return record;

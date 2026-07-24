@@ -1,5 +1,5 @@
 import AppMgr, { EventType } from '@/managers/appmgr';
-import ConnectionMgr from '@/managers/connectionmgr';
+import type ConnectionMgr from '@/managers/connectionmgr';
 import i18n from '@/utils/i18n';
 import { ConnectionType } from '@/utils/types';
 import Connection, { ConnectionState } from '@connections/connection';

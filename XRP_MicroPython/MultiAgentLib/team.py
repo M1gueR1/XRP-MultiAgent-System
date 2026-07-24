@@ -39,6 +39,7 @@ VALUE_NUMBER = 3
 VALUE_TEXT = 4
 VALUE_VECTOR2 = 5
 MAX_CHANNEL_BYTES = 32
+TARGET_RESOLUTION_TIMEOUT_MS = 7000
 
 
 def _default_hardware_identity():
@@ -191,7 +192,10 @@ class TeamLink:
         if normalized.isdigit():
             return self.resolve_target(int(normalized))
         started_at = ticks_ms()
-        while normalized not in self._directory and ticks_diff(ticks_ms(), started_at) < 3000:
+        while (
+            normalized not in self._directory
+            and ticks_diff(ticks_ms(), started_at) < TARGET_RESOLUTION_TIMEOUT_MS
+        ):
             self.update()
             sleep_ms(10)
         if normalized in self._directory:

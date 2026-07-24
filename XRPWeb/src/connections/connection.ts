@@ -1,4 +1,4 @@
-import ConnectionMgr from "@/managers/connectionmgr";
+import type ConnectionMgr from "@/managers/connectionmgr";
 import logger from "@/utils/logger";
 import Joystick from '@/managers/joystickmgr';
 import TableMgr from '@/managers/tablemgr';

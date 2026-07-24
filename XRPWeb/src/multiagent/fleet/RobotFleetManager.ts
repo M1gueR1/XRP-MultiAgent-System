@@ -565,8 +565,8 @@ export class RobotFleetManager {
       await this.broadcast({
         topicId: MultiAgentTopic.TEAM_DIRECTORY,
         payload,
-        qos: chunks.length === 1 ? 'latest' : 'normal',
-        ttlMs: 3000,
+        qos: 'reliable',
+        ttlMs: 7000,
       }).catch(() => undefined);
     }
   }

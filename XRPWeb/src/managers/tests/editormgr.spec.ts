@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import EditorMgr, { EditorSession } from '@/managers/editormgr';
 import { EditorType } from '@/utils/types';
 import { Model } from 'flexlayout-react';
+import { StorageKeys } from '@/utils/localstorage';
 
 describe('EditorMgr', () => {
     let editorMgr: EditorMgr;
@@ -63,5 +64,22 @@ describe('EditorMgr', () => {
         expect(editorMgr.getFontsize(session.id)).toBe(14);
         editorMgr.setFontsize(session.id, 16);
         expect(editorMgr.getFontsize(session.id)).toBe(16);
+    });
+
+    it('persists the XRP owner of a Python tab', () => {
+        const ownedSession: EditorSession = {
+            ...session,
+            id: 'robot-owned-editor',
+            robotSessionId: 'ble-xrp-a',
+        };
+        editorMgr.AddEditor(ownedSession);
+
+        editorMgr.SaveToLocalStorage(ownedSession, ownedSession.content ?? '');
+
+        const stores = JSON.parse(localStorage.getItem(StorageKeys.EDITORSTORE) ?? '[]') as Array<{
+            id: string;
+            robotSessionId?: string | null;
+        }>;
+        expect(stores.find((store) => store.id === ownedSession.id)?.robotSessionId).toBe('ble-xrp-a');
     });
 });

@@ -264,6 +264,10 @@ const MonacoEditor = ({
                     EditorMgr.getInstance().getEditorSession(tabId);
                 const loadContent = JSON.parse(content);
                 if (loadContent.name !== nameRef.current || loadContent.path !== session?.path) return;
+                if (
+                    loadContent.robotSessionId !== undefined &&
+                    loadContent.robotSessionId !== session?.robotSessionId
+                ) return;
                 if (editorRef.current && editor.current) {
                     const model = monaco.editor.createModel(loadContent.content, languageId);
                     editor.current.setModel(model);

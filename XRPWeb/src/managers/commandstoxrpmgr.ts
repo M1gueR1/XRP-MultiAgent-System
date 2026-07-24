@@ -48,6 +48,7 @@ export class CommandToXRPMgr {
     private mpVersion: string | number[] = [];
     private mpBuild: string | undefined = undefined;
     private mpFilename: string | undefined = undefined;
+    private readonly preparedDirectories = new Set<string>();
     phewList = ["__init__.py","dns.py","logging.py","server.py","template.py"];
     bleList = ["__init__.py","blerepl.py", "ble_uart_peripheral.py", "isrunning"] 
     XRPId:string | undefined = undefined;
@@ -155,6 +156,10 @@ export class CommandToXRPMgr {
      * @param connection 
      */
     public setConnection(connection: Connection) {
+        if (this.connection !== connection) {
+            this.preparedDirectories.clear();
+            this.lastRun = undefined;
+        }
         this.connection = connection;
     }
 
@@ -734,9 +739,10 @@ export class CommandToXRPMgr {
         }
 
         const pathToFile = filePath.substring(0, filePath.lastIndexOf('/'));
-        await this.buildPath(pathToFile);
+        await this.ensureDirectory(pathToFile);
 
         this.BUSY = true;
+        try {
         if (usePercent)
             AppMgr.getInstance().emit(EventType.EVENT_PROGRESS, '0');
 
@@ -796,7 +802,15 @@ export class CommandToXRPMgr {
 
 
 
-        await this.connection?.writeUtilityCmdRaw(writeFileScript, true, 1, "started");  //we wait until we print started, otherwise we may write a binary ctl character before the micropython.kbd_intr(-1)
+        const startResponse = await this.connection?.writeUtilityCmdRaw(
+            writeFileScript,
+            true,
+            1,
+            "started",
+        );
+        if (!startResponse?.some((line) => line.includes("started"))) {
+            throw new Error(`The XRP did not start receiving ${filePath}.`);
+        }
 
         // https://stackoverflow.com/a/1127966
         //var bytesLenStr = "" + bytes.length;
@@ -812,7 +826,9 @@ export class CommandToXRPMgr {
         const numberOfChunks = Math.ceil(bytes.length / this.connection!.XRP_SEND_BLOCK_SIZE);
         let currentPercent = 3;
         const endingPercent = 100;
-        const percentStep = (endingPercent - currentPercent) / numberOfChunks;
+        const percentStep = numberOfChunks > 0
+            ? (endingPercent - currentPercent) / numberOfChunks
+            : 0;
 
 
         let bytesSent = 0;
@@ -855,7 +871,213 @@ export class CommandToXRPMgr {
 
         // await this.haltUntilRead(1);
         await this.connection?.getToNormal(3);
-        this.BUSY = false;
+        } finally {
+            this.BUSY = false;
+        }
+    }
+
+    private async ensureDirectory(path: string): Promise<void> {
+        if (!path || path === '/' || this.preparedDirectories.has(path)) return;
+        await this.buildPath(path);
+        this.preparedDirectories.add(path);
+    }
+
+    /**
+     * Upload several files through one Raw REPL streaming session.
+     *
+     * BLE has a noticeable fixed cost every time we enter/leave Raw REPL. The
+     * MultiAgentLib bundle contains several small Python modules, so uploading
+     * them individually made the first team Run spend most of its time changing
+     * REPL modes rather than transferring bytes.
+     */
+    async uploadFileBatch(
+        files: ReadonlyArray<{ path: string; content: string | Uint8Array }>,
+    ): Promise<void> {
+        if (files.length === 0) return;
+        if (this.BUSY) {
+            throw new Error('The XRP is busy and cannot receive the file bundle.');
+        }
+        const connection = this.connection;
+        if (!connection?.isConnected()) {
+            throw new Error('No XRP is connected.');
+        }
+
+        const encoder = new TextEncoder();
+        const encodedFiles = files.map(({ path, content }) => ({
+            path,
+            bytes: typeof content === 'string' ? encoder.encode(content) : content,
+        }));
+        const parentPaths = [...new Set(encodedFiles.map(({ path }) =>
+            path.substring(0, path.lastIndexOf('/')),
+        ))];
+        for (const parentPath of parentPaths) {
+            await this.ensureDirectory(parentPath);
+        }
+
+        const totalByteLength = encodedFiles.reduce(
+            (total, file) => total + file.bytes.length,
+            0,
+        );
+        const payload = new Uint8Array(totalByteLength);
+        let payloadOffset = 0;
+        for (const file of encodedFiles) {
+            payload.set(file.bytes, payloadOffset);
+            payloadOffset += file.bytes.length;
+        }
+
+        const fileSpecs = encodedFiles
+            .map(({ path, bytes }) => `(${JSON.stringify(path)}, ${bytes.length})`)
+            .join(',');
+        const writeBundleScript =
+            "import micropython\n" +
+            "import sys\n" +
+            "import time\n" +
+            `blocksize = ${connection.XRP_SEND_BLOCK_SIZE}\n` +
+            `file_specs = [${fileSpecs}]\n` +
+            `total_size = ${totalByteLength}\n` +
+            "micropython.kbd_intr(-1)\n" +
+            "time.sleep(0.035)\n" +
+            "print('XRPBATCH_STARTED')\n" +
+            "read_buffer = bytearray(blocksize)\n" +
+            "received = 0\n" +
+            "spec_index = 0\n" +
+            "current_file = None\n" +
+            "remaining = 0\n" +
+            "while received < total_size:\n" +
+            "    amount = sys.stdin.buffer.readinto(read_buffer, blocksize)\n" +
+            "    if amount is None:\n" +
+            "        continue\n" +
+            "    valid = amount\n" +
+            "    if received + valid > total_size:\n" +
+            "        valid = total_size - received\n" +
+            "    position = 0\n" +
+            "    while position < valid:\n" +
+            "        if current_file is None:\n" +
+            "            file_path, remaining = file_specs[spec_index]\n" +
+            "            spec_index += 1\n" +
+            "            current_file = open(file_path, 'wb')\n" +
+            "            if remaining == 0:\n" +
+            "                current_file.close()\n" +
+            "                current_file = None\n" +
+            "                continue\n" +
+            "        write_count = remaining\n" +
+            "        available = valid - position\n" +
+            "        if write_count > available:\n" +
+            "            write_count = available\n" +
+            "        current_file.write(memoryview(read_buffer)[position:position + write_count])\n" +
+            "        position += write_count\n" +
+            "        remaining -= write_count\n" +
+            "        if remaining == 0:\n" +
+            "            current_file.close()\n" +
+            "            current_file = None\n" +
+            "    received += valid\n" +
+            "if current_file is not None:\n" +
+            "    current_file.close()\n" +
+            "micropython.kbd_intr(0x03)\n" +
+            "print('XRPBATCH_DONE')\n";
+
+        this.BUSY = true;
+        try {
+            const startResponse = await connection.writeUtilityCmdRaw(
+                writeBundleScript,
+                true,
+                1,
+                'XRPBATCH_STARTED',
+            );
+            if (!startResponse?.some((line) => line.includes('XRPBATCH_STARTED'))) {
+                throw new Error('The XRP did not start receiving the file bundle.');
+            }
+
+            connection.startReaduntil('XRPBATCH_DONE');
+            const numberOfChunks = Math.ceil(payload.length / connection.XRP_SEND_BLOCK_SIZE);
+            for (let index = 0; index < numberOfChunks; index += 1) {
+                const start = index * connection.XRP_SEND_BLOCK_SIZE;
+                const end = Math.min(start + connection.XRP_SEND_BLOCK_SIZE, payload.length);
+                let chunk = payload.slice(start, end);
+                if (
+                    index === numberOfChunks - 1 &&
+                    chunk.length < connection.XRP_SEND_BLOCK_SIZE
+                ) {
+                    const padded = new Uint8Array(connection.XRP_SEND_BLOCK_SIZE);
+                    padded.fill(255);
+                    padded.set(chunk);
+                    chunk = padded;
+                }
+                await connection.writeToDevice(chunk);
+            }
+
+            const completionResponse = await connection.haltUntilRead(1, 600);
+            if (!completionResponse.some((line) => line.includes('XRPBATCH_DONE'))) {
+                throw new Error('The XRP did not finish receiving the file bundle.');
+            }
+        } finally {
+            try {
+                await connection.getToNormal(3);
+            } finally {
+                this.BUSY = false;
+            }
+        }
+    }
+
+    async verifyUploadedFiles(
+        files: ReadonlyArray<{ path: string; byteLength: number }>,
+    ): Promise<void> {
+        if (files.length === 0) return;
+        if (this.BUSY) {
+            throw new Error('The XRP is busy and cannot verify uploaded files.');
+        }
+        const connection = this.connection;
+        if (!connection?.isConnected()) {
+            throw new Error('No XRP is connected.');
+        }
+
+        const checks = files
+            .map(({ path, byteLength }) => `(${JSON.stringify(path)}, ${byteLength})`)
+            .join(',');
+        const command =
+            "import os\n" +
+            `for verify_path, expected_size in [${checks}]:\n` +
+            "    try:\n" +
+            "        actual_size = os.stat(verify_path)[6]\n" +
+            "    except OSError:\n" +
+            "        actual_size = -1\n" +
+            "    print('XRPVERIFY:' + verify_path + ':' + str(actual_size))\n" +
+            "print('XRPVERIFY_DONE')\n";
+
+        this.BUSY = true;
+        try {
+            const maximumAttempts = 2;
+            let lastOutput = '';
+            for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+                const response = await connection.writeUtilityCmdRaw(
+                    command,
+                    true,
+                    1,
+                    'XRPVERIFY_DONE',
+                );
+                lastOutput = response?.join('\n') ?? '';
+                const missing = files.find(({ path, byteLength }) =>
+                    !lastOutput.includes(`XRPVERIFY:${path}:${byteLength}`),
+                );
+                if (!missing) return;
+                if (attempt < maximumAttempts) {
+                    await connection.getToNormal(3);
+                    await new Promise((resolve) => setTimeout(resolve, 50));
+                    continue;
+                }
+                throw new Error(
+                    `XRP upload verification failed for ${missing.path}. ` +
+                    `Expected ${missing.byteLength} bytes on the XRP after ${maximumAttempts} attempts. ` +
+                    `Last response: ${lastOutput || '(empty)'}`,
+                );
+            }
+        } finally {
+            try {
+                await connection.getToNormal(3);
+            } finally {
+                this.BUSY = false;
+            }
+        }
     }
 
     async uploadFiles(path: string, fileHandles: FileSystemFileHandle[]) {
@@ -1019,13 +1241,28 @@ export class CommandToXRPMgr {
             "      del sys.modules['XRPLib.resetbot']\n" +
             "   import XRPLib.resetbot";
 
-        if (this.lastRun == undefined || this.lastRun != fileToEx) {
-            this.BUSY = false; // make sure we are not busy before uploading the file
-            await this.uploadFile("//main.py", value, usePercent); //no need to save the main file again if it is the same file to execute.
-            this.BUSY = true; // make sure we are busy after uploading the file
+        this.BUSY = false;
+        const mainFile = {
+            path: '/main.py',
+            byteLength: new TextEncoder().encode(value).length,
+        };
+        let needsMainUpload = this.lastRun == undefined || this.lastRun != fileToEx;
+        let mainFileVerified = false;
+        if (!needsMainUpload) {
+            try {
+                await this.verifyUploadedFiles([mainFile]);
+                mainFileVerified = true;
+            } catch {
+                needsMainUpload = true;
+            }
+        }
+        if (needsMainUpload) {
+            await this.uploadFile("//main.py", value, usePercent);
+        }
+        if (!mainFileVerified) {
+            await this.verifyUploadedFiles([mainFile]);
         }
         this.lastRun = fileToEx;
-        this.BUSY = false;
 
         return value;
     }
@@ -1059,8 +1296,13 @@ export class CommandToXRPMgr {
 
         lines = cleanUp + lines;
 
-        await this.connection?.goCommand(lines);
-        this.BUSY = false;
+        try {
+            await this.connection?.goCommand(lines);
+        } finally {
+            // A failed or interrupted BLE write must not leave this XRP's
+            // command manager permanently busy for every later Run attempt.
+            this.BUSY = false;
+        }
         if (this.DEBUG_CONSOLE_ON) this.cmdLogger.debug("fcg: out of executeLines");
 
         // Make sure to update the filesystem as there is a small chance that the program saved something like a log file.

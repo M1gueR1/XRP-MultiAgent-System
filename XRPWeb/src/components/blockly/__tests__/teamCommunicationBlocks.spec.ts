@@ -9,6 +9,7 @@ vi.mock('../../dashboard/emotions/customEmotionStore', () => ({
 
 import '../xrp_blocks';
 import '../xrp_blocks_python';
+import { blocklyToPython } from '../blocklyCodegen';
 import BlocklyConfigs from '../xrp_blockly_configs';
 
 function connectValue(parent: Blockly.Block, inputName: string, child: Blockly.Block): void {
@@ -37,6 +38,15 @@ describe('XRP team communication Blockly blocks', () => {
     expect(code).toContain('from MultiAgentLib.team import get_default_team');
     expect(code).toContain('xrpTeam = get_default_team()');
     expect(code).toContain('xrpTeam.broadcast("distance", rangefinder.distance(), mode="latest")');
+  });
+
+  it('serializes Blockly sessions as runnable Python with embedded block metadata', () => {
+    workspace.newBlock('xrp_team_start');
+
+    const code = blocklyToPython(workspace);
+
+    expect(code).toContain('xrpTeam.start()');
+    expect(code).toContain('##XRPBLOCKS ');
   });
 
   it('generates the student-friendly start block as a ready wait loop', () => {

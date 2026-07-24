@@ -81,6 +81,7 @@ import BackupDlg from '@components/dialogs/backupdlg';
 import RestoreDlg from '@components/dialogs/restoredlg';
 import MultiRobotSaveDialog from '@/components/dialogs/multi-robot-save-dialog';
 import type { MultiRobotEditorRequest, MultiRobotSaveRequest } from '@/connections/ideRobotTypes';
+import { blocklyToPython } from '@components/blockly/blocklyCodegen';
 
 type NavBarProps = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -88,6 +89,12 @@ type NavBarProps = {
 };
 
 let hasSubscribed = false;
+
+function syncBlocklySessionContent(session: EditorSession | undefined): void {
+    if (session?.type !== EditorType.BLOCKLY || !session.workspace) return;
+    const code = blocklyToPython(session.workspace);
+    EditorMgr.getInstance().SaveToLocalStorage(session, code);
+}
 
 /**
  * NavBar component - create the navigation bar
@@ -260,7 +267,13 @@ function NavBar({ layoutref }: NavBarProps) {
                     await CommandToXRPMgr.getInstance()
                         .getFileContents(filePathData.xrpPath)
                         .then((content) => {
-                            loadXRPEditor(content, fileType, filename, filePathData.xrpPath);
+                            loadXRPEditor(
+                                content,
+                                fileType,
+                                filename,
+                                filePathData.xrpPath,
+                                mewFileData.robotSessionId,
+                            );
                         });
                 }
             });
@@ -341,12 +354,12 @@ function NavBar({ layoutref }: NavBarProps) {
 
             AppMgr.getInstance().on(EventType.EVENT_SHOWBLUETOOTH_CONNECTING, () => {
                 setDialogContent(<BusyDialog title={t('connecting-bluetooth')} />);
-                toggleDialog();
+                openDialog();
             });
 
             AppMgr.getInstance().on(EventType.EVENT_HIDE_BLUETOOTH_CONNECTING, () => {
                 setDialogContent(<div />);
-                toggleDialog();
+                closeDialog();
             });
 
             hasSubscribed = true;
@@ -397,7 +410,12 @@ function NavBar({ layoutref }: NavBarProps) {
             } else {
                 content = fileContent;
             }
-            const loadContent = { name: filename, path: filePathData.path, content: content };
+            const loadContent = {
+                name: filename,
+                path: filePathData.path,
+                content,
+                robotSessionId: filePathData.robotSessionId,
+            };
             AppMgr.getInstance().emit(EventType.EVENT_EDITOR_LOAD, JSON.stringify(loadContent));
         });
     }
@@ -409,7 +427,13 @@ function NavBar({ layoutref }: NavBarProps) {
      * @param filename
      * @param path
      */
-    function loadXRPEditor(content: number[], fileType: FileType, filename: string, path: string) {
+    function loadXRPEditor(
+        content: number[],
+        fileType: FileType,
+        filename: string,
+        path: string,
+        robotSessionId: string | null | undefined = AppMgr.getInstance().getActiveRobotSessionId(),
+    ) {
         // if the file is a block files, extract the blockly JSON out of the comment ##XRPBLOCKS
         let bytes = content;
         if (fileType === FileType.BLOCKLY) {
@@ -420,7 +444,7 @@ function NavBar({ layoutref }: NavBarProps) {
         const text =
             typeof bytes === 'string' ? bytes : new TextDecoder().decode(new Uint8Array(bytes));
         // set the content in the editor
-        const loadContent = { name: filename, path: path, content: text };
+        const loadContent = { name: filename, path: path, content: text, robotSessionId };
         AppMgr.getInstance().emit(EventType.EVENT_EDITOR_LOAD, JSON.stringify(loadContent));
     }
 
@@ -1085,6 +1109,7 @@ function NavBar({ layoutref }: NavBarProps) {
             }
 
             const selectedSession = EditorMgr.getInstance().getEditorSession(activeTab);
+            syncBlocklySessionContent(selectedSession);
             if (selectedSession && !EditorMgr.getInstance().targetsActiveRobot(selectedSession)) {
                 setDialogContent(
                     <AlertDialog
@@ -1220,6 +1245,13 @@ function NavBar({ layoutref }: NavBarProps) {
                             } else {
                                 broadcastRunningState(false);
                             }
+                            setDialogContent(
+                                <AlertDialog
+                                    alertMessage={err instanceof Error ? err.message : String(err)}
+                                    toggleDialog={toggleDialog}
+                                />,
+                            );
+                            if (!dialogRef.current?.open) dialogRef.current?.showModal();
                         }
                     };
 
@@ -1406,14 +1438,27 @@ function NavBar({ layoutref }: NavBarProps) {
     /**
      * toggleDialog - toggle the dialog open and closed
      */
-    function toggleDialog() {
-        if (!dialogRef.current) {
-            return;
+    function openDialog() {
+        setDlgOpen(true);
+        if (dialogRef.current && !dialogRef.current.open) {
+            dialogRef.current.showModal();
         }
-        if (dialogRef.current.hasAttribute('open')) {
-            setDialogContent(<div />);
+    }
+
+    function closeDialog() {
+        setDlgOpen(false);
+        if (dialogRef.current?.open) {
             dialogRef.current.close();
-        } else dialogRef.current.showModal();
+        }
+    }
+
+    function toggleDialog() {
+        if (dialogRef.current?.open) {
+            setDialogContent(<div />);
+            closeDialog();
+        } else {
+            openDialog();
+        }
     }
 
     /**
