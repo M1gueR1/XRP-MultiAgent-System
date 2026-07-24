@@ -1,30 +1,22 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { FaProjectDiagram, FaTrash } from "react-icons/fa";
 import {
   BROADCAST_ROBOT_ID,
-  FleetBenchmark,
   getRobotFleetManager,
   MultiAgentTopic,
   encodeEmotionState,
-  type FleetBenchmarkResult,
   type FleetSnapshot,
-  type MessageQos,
 } from "@/multiagent";
 import AppMgr, { EventType } from "@/managers/appmgr";
 import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import type { BLERobotFleetSnapshot } from "@/connections/bluetoothFleetTypes";
 import type { IDERobotRuntimeState, MultiRobotEditorRequest } from "@/connections/ideRobotTypes";
+import { useGridStackWidget } from "../hooks/useGridStackWidget";
+import SensorCard from "./SensorCard";
 
 const fleet = getRobotFleetManager();
 const appMgr = AppMgr.getInstance();
-
-function downloadJson(value: unknown, filename: string): void {
-  const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
+const INITIAL_STATUS = "Ready. Add each cable-connected XRP, then choose which robot owns the IDE files.";
 
 function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
   const title = state === "idle"
@@ -41,28 +33,17 @@ function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
       : state === "stopping"
         ? "animate-pulse bg-orange-400 shadow-[0_0_8px_rgba(251,146,60,0.9)]"
         : "animate-pulse bg-yellow-300 shadow-[0_0_8px_rgba(250,204,21,0.9)]";
-  return (
-    <span
-      title={title}
-      className={`inline-block h-2.5 w-2.5 rounded-full ${color}`}
-    />
-  );
+  return <span title={title} className={`inline-block h-2.5 w-2.5 rounded-full ${color}`} />;
 }
 
 export default function MultiAgentLabWidget() {
+  const { handleDelete } = useGridStackWidget();
   const [snapshot, setSnapshot] = useState<FleetSnapshot>(() => fleet.snapshot());
   const [usbSnapshot, setUsbSnapshot] = useState<USBRobotFleetSnapshot>(() => appMgr.getUSBFleetSnapshot());
   const [bleIDESnapshot, setBleIDESnapshot] = useState<BLERobotFleetSnapshot>(() => appMgr.getBluetoothIDEFleetSnapshot());
-  const [status, setStatus] = useState("Ready. Add each cable-connected XRP, then choose which robot owns the IDE files.");
+  const [status, setStatus] = useState(INITIAL_STATUS);
   const [target, setTarget] = useState(String(BROADCAST_ROBOT_ID));
-  const [topic, setTopic] = useState("0001");
-  const [payload, setPayload] = useState("hello fleet");
-  const [payloadMode, setPayloadMode] = useState<"text" | "number" | "hex">("text");
-  const [qos, setQos] = useState<MessageQos>("reliable");
-  const [frequency, setFrequency] = useState(20);
-  const [benchmarkResult, setBenchmarkResult] = useState<FleetBenchmarkResult | null>(null);
-  const benchmark = useMemo(() => new FleetBenchmark(fleet), []);
-  const [benchmarkRunning, setBenchmarkRunning] = useState(false);
+  const [showMessageTester, setShowMessageTester] = useState(false);
   const [showMultiEditorChoices, setShowMultiEditorChoices] = useState(false);
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
@@ -159,38 +140,37 @@ export default function MultiAgentLabWidget() {
     }
   };
 
-  const sendInspectorMessage = async () => {
+  const sendTestMessage = async () => {
     const targetId = Number(target);
-    const topicId = Number.parseInt(topic.replace(/^0x/i, ""), 16);
-    let bytes: Uint8Array;
-    if (payloadMode === "number") {
-      const numeric = Number(payload);
-      if (!Number.isFinite(numeric)) throw new Error("Diagnostic number payload is invalid.");
-      bytes = new Uint8Array(8);
-      new DataView(bytes.buffer).setFloat64(0, numeric, true);
-    } else if (payloadMode === "hex") {
-      const normalized = payload.replace(/\s+/g, "");
-      if (!/^(?:[0-9a-fA-F]{2})*$/.test(normalized)) throw new Error("Hex payload must contain complete byte pairs.");
-      bytes = Uint8Array.from(normalized.match(/.{2}/g)?.map((byte) => Number.parseInt(byte, 16)) ?? []);
-    } else {
-      bytes = new TextEncoder().encode(payload);
-    }
-    if (targetId === BROADCAST_ROBOT_ID) {
-      await fleet.broadcast({ topicId, payload: bytes, qos, ttlMs: qos === "latest" ? 250 : 2000 });
-    } else {
-      await fleet.publish({ targetRobotId: targetId, topicId, payload: bytes, qos, ttlMs: qos === "latest" ? 250 : 2000 });
-    }
-  };
-
-  const stopBenchmark = () => {
     try {
-      const result = benchmark.stop("physical");
-      setBenchmarkResult(result);
-      setBenchmarkRunning(false);
-      setStatus("Benchmark stopped. Results are measured locally; no physical-rate claim is inferred.");
+      if (targetId === BROADCAST_ROBOT_ID) {
+        const readyRobotIds = snapshot.sessions
+          .filter((session) => session.state === "ready" && session.robotId !== undefined)
+          .map((session) => session.robotId!);
+        if (readyRobotIds.length === 0) throw new Error("No ready robots are available for a test message.");
+        await Promise.all(readyRobotIds.map((robotId) => fleet.ping(robotId)));
+        setStatus(`Test message sent to ${readyRobotIds.length} robot${readyRobotIds.length === 1 ? "" : "s"}.`);
+      } else {
+        await fleet.ping(targetId);
+        setStatus(`Test message sent to robot ${targetId}.`);
+      }
+      setShowMessageTester(false);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
     }
+  };
+
+  const openMessageTester = () => {
+    const targetStillExists = target === String(BROADCAST_ROBOT_ID)
+      || snapshot.sessions.some((session) => session.robotId !== undefined && String(session.robotId) === target);
+    if (!targetStillExists) setTarget(String(BROADCAST_ROBOT_ID));
+    setShowMessageTester(true);
+  };
+
+  const closeMessageTester = () => setShowMessageTester(false);
+
+  const handleMessageTesterBackdrop = (event: MouseEvent<HTMLDivElement>) => {
+    if (event.target === event.currentTarget) closeMessageTester();
   };
 
   const createMultiRobotEditor = (fileType: "python" | "blockly") => {
@@ -220,16 +200,35 @@ export default function MultiAgentLabWidget() {
     setStatus(`Multi-XRP ${fileType} tab created for ${connectedIDERobots.length} robots. Its Run button is purple.`);
   };
 
-  return (
-    <section className="h-full overflow-auto bg-black p-3 text-sm text-white">
-      <div className="mb-4 rounded border-2 border-purple-500 bg-purple-950/30 p-3">
+  const messageTargetOptions = snapshot.sessions
+    .filter((session) => session.robotId !== undefined)
+    .map((session) => (
+      <option key={session.sessionId} value={String(session.robotId)}>
+        {session.alias} ({session.robotId})
+      </option>
+    ));
+
+  const readyMessageTargets = snapshot.sessions.some((session) => session.state === "ready" && session.robotId !== undefined);
+  const routingRows = snapshot.routingLog.map((entry) => (
+    <div key={entry.id} className="grid grid-cols-[5rem_3rem_1rem_3rem_4rem_1fr] gap-1 border-t border-gray-800 py-1">
+      <span>{new Date(entry.time).toLocaleTimeString()}</span>
+      <span>{entry.sourceRobotId}</span>
+      <span>-&gt;</span>
+      <span>{entry.targetRobotId}</span>
+      <span>0x{entry.topicId.toString(16).padStart(4, "0")}</span>
+      <span>{entry.status}{entry.rttMs !== undefined ? ` ${entry.rttMs.toFixed(1)}ms` : ""}</span>
+    </div>
+  ));
+
+  const content = (
+    <section className="flex h-full w-full flex-col gap-3 overflow-auto rounded-xl bg-black p-3 pt-1 text-xs text-white">
+      <div className="rounded-xl border border-purple-500/70 bg-purple-950/20 p-3 shadow-[0_0_22px_rgba(168,85,247,0.12)]">
         <div className="flex flex-wrap items-center gap-2">
           <div className="mr-auto">
-            <h2 className="text-lg font-semibold">Multi-XRP program</h2>
-            <p className="text-xs text-gray-300">One editor tab, one program, and parallel Run across all assigned IDE robots.</p>
+            <h2 className="text-base font-bold">Program All XRPs at Once</h2>
           </div>
           <button
-            className="rounded bg-purple-700 px-3 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-lg border border-purple-300 bg-purple-700 px-3 py-2 font-bold text-white transition hover:bg-purple-600 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={connectedIDERobots.length < 2}
             onClick={() => setShowMultiEditorChoices((visible) => !visible)}
           >
@@ -238,29 +237,26 @@ export default function MultiAgentLabWidget() {
         </div>
         {connectedIDERobots.length < 2 && <p className="mt-2 text-xs text-yellow-300">Connect at least two robots in the USB or Bluetooth IDE fleet.</p>}
         {showMultiEditorChoices && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-purple-500 pt-3">
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-purple-400/60 pt-3">
             <span className="text-sm">Create:</span>
-            <button className="rounded border border-purple-300 px-3 py-2" onClick={() => createMultiRobotEditor("python")}>Python file</button>
-            <button className="rounded border border-purple-300 px-3 py-2" onClick={() => createMultiRobotEditor("blockly")}>Blockly file</button>
+            <button className="rounded-lg border border-purple-300 bg-black px-3 py-2 font-bold text-white transition hover:bg-purple-500 hover:text-black" onClick={() => createMultiRobotEditor("python")}>Python file</button>
+            <button className="rounded-lg border border-purple-300 bg-black px-3 py-2 font-bold text-white transition hover:bg-purple-500 hover:text-black" onClick={() => createMultiRobotEditor("blockly")}>Blockly file</button>
             <span className="text-xs text-gray-300">Targets: {connectedIDERobots.map((robot) => robot.alias).join(", ")}</span>
           </div>
         )}
       </div>
 
-      <div className="mb-4 rounded border border-white p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="mr-auto">
-            <h2 className="text-lg font-semibold">USB robot fleet</h2>
-            <p className="text-xs text-gray-300">No program is required on the XRP. Its normal MicroPython firmware handles the connection.</p>
+      <div className="grid gap-3 xl:grid-cols-2">
+        <div className="rounded-xl border border-white bg-black p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="mr-auto text-base font-bold">USB Robot Fleet</h2>
+            <button className="rounded-lg border border-white bg-black px-3 py-1.5 font-bold text-white transition hover:bg-white hover:text-black disabled:cursor-not-allowed disabled:opacity-50" disabled={!usbSnapshot.supported} onClick={() => void run(() => appMgr.addUSBRobot(), "USB XRP connected and selected for the IDE.")}>Add XRP by USB</button>
+            <button className="rounded-lg border border-white bg-black px-3 py-1.5 font-bold text-white transition hover:bg-white hover:text-black" onClick={() => void run(() => appMgr.disconnectAllUSBRobots(), "All USB XRPs disconnected.")}>Disconnect USB fleet</button>
           </div>
-          <button className="rounded border border-white px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50" disabled={!usbSnapshot.supported} onClick={() => void run(() => appMgr.addUSBRobot(), "USB XRP connected and selected for the IDE.")}>Add XRP by USB</button>
-          <button className="rounded border border-white px-2 py-1" onClick={() => void run(() => appMgr.disconnectAllUSBRobots(), "All USB XRPs disconnected.")}>Disconnect USB fleet</button>
-        </div>
-        {!usbSnapshot.supported && <p className="mt-2 text-yellow-300">Web Serial is unavailable. Open the dashboard in Chrome or Edge using localhost or HTTPS.</p>}
-        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-          {usbSnapshot.sessions.length === 0 && <p className="text-gray-400">Connect both XRP robots by cable, then press “Add XRP by USB” once for each robot.</p>}
-          {usbSnapshot.sessions.map((session) => (
-            <article key={session.sessionId} className={`rounded border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-gray-500 bg-gray-950"}`}>
+          {!usbSnapshot.supported && <p className="mt-2 text-yellow-300">Web Serial is unavailable. Open the dashboard in Chrome or Edge using localhost or HTTPS.</p>}
+          <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+            {usbSnapshot.sessions.map((session) => (
+            <article key={session.sessionId} className={`rounded-xl border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-zinc-700 bg-zinc-950"}`}>
               <div className="flex items-center justify-between gap-2">
                 <strong className="flex items-center gap-2"><RuntimeDot state={session.runtimeState} />{session.alias}</strong>
                 <span className={session.state === "connected" ? "text-green-400" : session.state === "error" ? "text-red-400" : "text-yellow-300"}>{session.state}</span>
@@ -272,31 +268,27 @@ export default function MultiAgentLabWidget() {
               </dl>
               {session.error && <p className="mt-2 text-xs text-red-300">{session.error}</p>}
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
-                {session.state === "connected" && <button className="rounded border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectUSBRobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
-                {(session.state === "disconnected" || session.state === "error") && <button className="rounded border px-2 py-1" onClick={() => void run(() => appMgr.reconnectUSBRobot(session.sessionId), `${session.alias} reconnected.`)}>Reconnect</button>}
-                {session.state !== "disconnected" && <button className="rounded border px-2 py-1" onClick={() => void run(() => appMgr.disconnectUSBRobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
-                <button className="rounded border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameUSBRobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
-                <button className="rounded border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => appMgr.removeUSBRobot(session.sessionId), `${session.alias} removed.`)}>Remove</button>
+                {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectUSBRobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
+                {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectUSBRobot(session.sessionId), `${session.alias} reconnected.`)}>Reconnect</button>}
+                {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectUSBRobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
+                <button className="rounded-lg border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameUSBRobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
+                <button className="rounded-lg border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => appMgr.removeUSBRobot(session.sessionId), `${session.alias} removed.`)}>Remove</button>
               </div>
             </article>
           ))}
-        </div>
-      </div>
-
-      <div className="mb-4 rounded border border-cyan-300 p-3">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="mr-auto">
-            <h2 className="text-lg font-semibold">Bluetooth IDE robot fleet</h2>
-            <p className="text-xs text-gray-300">Full files, terminal, Save and Run over the XRP firmware BLE REPL. No user program or cable required.</p>
           </div>
-          <button className="rounded border border-cyan-300 px-2 py-1 disabled:cursor-not-allowed disabled:opacity-50" disabled={!bleIDESnapshot.supported} onClick={() => void run(() => appMgr.addBluetoothIDERobot(), "Bluetooth XRP connected and selected for the IDE.")}>Add XRP by Bluetooth</button>
-          <button className="rounded border border-cyan-300 px-2 py-1" onClick={() => void run(() => appMgr.disconnectAllBluetoothIDERobots(), "All Bluetooth IDE XRPs disconnected.")}>Disconnect Bluetooth fleet</button>
         </div>
-        {!bleIDESnapshot.supported && <p className="mt-2 text-yellow-300">Web Bluetooth is unavailable. Open the dashboard in Chrome or Edge using localhost or HTTPS.</p>}
-        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-          {bleIDESnapshot.sessions.length === 0 && <p className="text-gray-400">Turn on both battery-powered XRPs, then press “Add XRP by Bluetooth” once for each robot.</p>}
-          {bleIDESnapshot.sessions.map((session) => (
-            <article key={session.sessionId} className={`rounded border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-cyan-800 bg-gray-950"}`}>
+
+        <div className="rounded-xl border border-cyan-500/70 bg-black p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="mr-auto text-base font-bold">Bluetooth IDE Robot Fleet</h2>
+            <button className="rounded-lg border border-cyan-300 bg-black px-3 py-1.5 font-bold text-white transition hover:bg-cyan-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50" disabled={!bleIDESnapshot.supported} onClick={() => void run(() => appMgr.addBluetoothIDERobot(), "Bluetooth XRP connected and selected for the IDE.")}>Add XRP by Bluetooth</button>
+            <button className="rounded-lg border border-cyan-300 bg-black px-3 py-1.5 font-bold text-white transition hover:bg-cyan-500 hover:text-black" onClick={() => void run(() => appMgr.disconnectAllBluetoothIDERobots(), "All Bluetooth IDE XRPs disconnected.")}>Disconnect Bluetooth fleet</button>
+          </div>
+          {!bleIDESnapshot.supported && <p className="mt-2 text-yellow-300">Web Bluetooth is unavailable. Open the dashboard in Chrome or Edge using localhost or HTTPS.</p>}
+          <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+            {bleIDESnapshot.sessions.map((session) => (
+            <article key={session.sessionId} className={`rounded-xl border p-2 ${session.active ? "border-green-400 bg-green-950/30" : "border-cyan-800 bg-zinc-950"}`}>
               <div className="flex items-center justify-between gap-2">
                 <strong className="flex items-center gap-2"><RuntimeDot state={session.runtimeState} />{session.alias}</strong>
                 <span className={session.state === "connected" ? "text-green-400" : session.state === "error" ? "text-red-400" : "text-yellow-300"}>{session.state}</span>
@@ -309,83 +301,89 @@ export default function MultiAgentLabWidget() {
               </dl>
               {session.error && <p className="mt-2 text-xs text-red-300">{session.error}</p>}
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
-                {session.state === "connected" && <button className="rounded border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectBluetoothIDERobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
-                {(session.state === "disconnected" || session.state === "error") && <button className="rounded border px-2 py-1" onClick={() => void run(() => appMgr.reconnectBluetoothIDERobot(session.sessionId), `${session.alias} reconnected over Bluetooth.`)}>Reconnect</button>}
-                {session.state !== "disconnected" && <button className="rounded border px-2 py-1" onClick={() => void run(() => appMgr.disconnectBluetoothIDERobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
-                <button className="rounded border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameBluetoothIDERobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
-                <button className="rounded border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => appMgr.removeBluetoothIDERobot(session.sessionId), `${session.alias} removed.`)}>Remove</button>
+                {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectBluetoothIDERobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
+                {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectBluetoothIDERobot(session.sessionId), `${session.alias} reconnected over Bluetooth.`)}>Reconnect</button>}
+                {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectBluetoothIDERobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
+                <button className="rounded-lg border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameBluetoothIDERobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
+                <button className="rounded-lg border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => appMgr.removeBluetoothIDERobot(session.sessionId), `${session.alias} removed.`)}>Remove</button>
               </div>
             </article>
           ))}
+          </div>
         </div>
       </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-2 border-b border-white pb-3">
-        <div className="mr-auto"><h2 className="text-lg font-semibold">BLE message runtime</h2><p className="text-xs text-gray-400">Robot-to-robot routing through the laptop. Shared Blockly/Python programs install and attach MultiAgentLib automatically.</p></div>
-        <button className="rounded border border-white px-2 py-1" onClick={() => void run(() => fleet.addBluetoothRobot().then(() => undefined), "BLE runtime XRP added; waiting for handshake.")}>Add BLE runtime XRP</button>
-        <button className="rounded border border-white px-2 py-1" onClick={() => void run(() => fleet.broadcast({ topicId: MultiAgentTopic.SYSTEM_TEST, payload: new TextEncoder().encode("broadcast test"), qos: "reliable", ttlMs: 2000 }), "Broadcast test sent.")}>Broadcast test</button>
-        <button className="rounded border border-white px-2 py-1" onClick={() => void run(() => fleet.disconnectAll(), "Fleet disconnected.")}>Disconnect all</button>
-        {!benchmarkRunning ? (
-          <button className="rounded border border-white px-2 py-1" onClick={() => { try { benchmark.start(frequency); setBenchmarkRunning(true); setStatus("Benchmark running."); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } }}>Start benchmark</button>
-        ) : (
-          <button className="rounded border border-red-400 px-2 py-1 text-red-300" onClick={stopBenchmark}>Stop benchmark</button>
-        )}
-        <label className="flex items-center gap-1">Hz<input className="w-14 rounded border border-white bg-black px-1" type="number" min={10} max={25} value={frequency} onChange={(event) => setFrequency(Number(event.target.value))} /></label>
-        {benchmarkResult && <button className="rounded border border-white px-2 py-1" onClick={() => downloadJson(benchmarkResult, "xrp-fleet-benchmark.json")}>Export benchmark</button>}
-      </div>
+      {status !== INITIAL_STATUS && <p className="rounded-xl border border-zinc-700 bg-zinc-950 p-2 text-zinc-300">{status}</p>}
 
-      <p className="mb-3 rounded border border-gray-600 bg-gray-950 p-2 text-gray-300">{status}</p>
-
-      <div className="mb-4 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-        {snapshot.sessions.length === 0 && <p className="text-gray-400">No fleet robots. Each Add XRP press opens one browser device chooser.</p>}
-        {snapshot.sessions.map((session) => (
-          <article key={session.sessionId} className="rounded border border-white bg-gray-950 p-2">
-            <div className="flex items-center justify-between gap-2">
-              <strong>{session.alias}</strong>
-              <span className={session.health === "healthy" ? "text-green-400" : session.health === "degraded" ? "text-yellow-400" : "text-red-400"}>{session.state} / {session.health}</span>
-            </div>
-            <dl className="mt-2 grid grid-cols-2 gap-x-2 text-xs text-gray-300">
-              <dt>Robot ID</dt><dd>{session.robotId ?? "unassigned"}</dd>
-              <dt>Hardware</dt><dd className="truncate">{session.hardwareIdentity ?? "waiting"}</dd>
-              <dt>BLE device</dt><dd className="truncate">{session.deviceName ?? "unknown"}</dd>
-              <dt>Handshake</dt><dd>{session.state === "ready" ? "complete" : session.state}</dd>
-              <dt>Active legacy</dt><dd>{session.activeLegacyRobot ? "yes" : "no"}</dd>
-              <dt>Last seen</dt><dd>{session.metrics.lastReceivedAt ? new Date(session.metrics.lastReceivedAt).toLocaleTimeString() : "never"}</dd>
-              <dt>RTT latest / p95</dt><dd>{session.metrics.latestRttMs?.toFixed(1) ?? "—"} / {session.metrics.rttP95Ms?.toFixed(1) ?? "—"} ms</dd>
-              <dt>TX / RX</dt><dd>{session.metrics.messagesSent} / {session.metrics.messagesReceived}</dd>
-              <dt>Dropped / coalesced</dt><dd>{session.metrics.messagesDropped} / {session.metrics.messagesCoalesced}</dd>
-              <dt>Disconnects / reconnects</dt><dd>{session.metrics.disconnectCount} / {session.metrics.reconnectCount}</dd>
-              <dt>Queue depth</dt><dd>{session.metrics.outgoingQueueDepth}</dd>
-            </dl>
-            <div className="mt-2 flex flex-wrap gap-1 text-xs">
-              {session.state === "disconnected" || session.state === "error" ? <button className="rounded border px-2 py-1" onClick={() => void run(() => fleet.connectRobot(session.sessionId), "Reconnect started.")}>Reconnect</button> : <button className="rounded border px-2 py-1" onClick={() => void run(() => fleet.disconnectRobot(session.sessionId), "Robot disconnected.")}>Disconnect</button>}
-              {session.robotId !== undefined && <button className="rounded border px-2 py-1" onClick={() => void run(() => fleet.ping(session.robotId!), "Ping sent.")}>Ping</button>}
-              {session.robotId !== undefined && <button className="rounded border px-2 py-1" onClick={() => fleet.setActiveLegacyRobot(session.robotId!)}>Set active fleet robot</button>}
-              <button className="rounded border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) fleet.renameRobot(session.sessionId, alias); }}>Rename</button>
-              <button className="rounded border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => fleet.removeRobot(session.sessionId), "Robot removed from fleet.")}>Remove</button>
-            </div>
-          </article>
-        ))}
-      </div>
-
-      <fieldset className="mb-4 rounded border border-white p-2">
-        <legend className="px-1 font-semibold">Message inspector</legend>
-        <div className="grid gap-2 md:grid-cols-5">
-          <label>Target<select className="block w-full rounded border border-white bg-black p-1" value={target} onChange={(event) => setTarget(event.target.value)}><option value={BROADCAST_ROBOT_ID}>Broadcast</option>{snapshot.sessions.filter((session) => session.robotId !== undefined).map((session) => <option key={session.sessionId} value={session.robotId}>{session.alias} ({session.robotId})</option>)}</select></label>
-          <label>Topic hex<input className="block w-full rounded border border-white bg-black p-1" value={topic} onChange={(event) => setTopic(event.target.value)} /></label>
-          <label>Payload type<select className="block w-full rounded border border-white bg-black p-1" value={payloadMode} onChange={(event) => setPayloadMode(event.target.value as "text" | "number" | "hex")}><option value="text">Text</option><option value="number">Number (float64)</option><option value="hex">Hex bytes</option></select></label>
-          <label>Payload<input className="block w-full rounded border border-white bg-black p-1" value={payload} onChange={(event) => setPayload(event.target.value)} /></label>
-          <label>QoS<select className="block w-full rounded border border-white bg-black p-1" value={qos} onChange={(event) => setQos(event.target.value as MessageQos)}><option value="reliable">Reliable</option><option value="latest">Latest only</option><option value="normal">Normal</option></select></label>
+      <div className="rounded-xl border border-yellow-300/80 bg-zinc-950 p-3">
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <h3 className="mr-auto font-semibold text-yellow-100">Team Message Log</h3>
+          <button className="rounded-lg border border-yellow-300 bg-black px-3 py-1 text-xs font-bold text-yellow-100 transition hover:bg-yellow-300 hover:text-black" onClick={openMessageTester}>
+            Test message
+          </button>
         </div>
-        <button className="mt-2 rounded border border-white px-3 py-1" onClick={() => void run(sendInspectorMessage, "Inspector message sent.")}>Send message</button>
-      </fieldset>
-
-      <div className="rounded border border-white p-2">
-        <h3 className="mb-1 font-semibold">Bounded routing log</h3>
         <div className="max-h-48 overflow-auto font-mono text-xs">
-          {snapshot.routingLog.map((entry) => <div key={entry.id} className="grid grid-cols-[5rem_3rem_1rem_3rem_4rem_1fr] gap-1 border-t border-gray-800 py-1"><span>{new Date(entry.time).toLocaleTimeString()}</span><span>{entry.sourceRobotId}</span><span>→</span><span>{entry.targetRobotId}</span><span>0x{entry.topicId.toString(16).padStart(4, "0")}</span><span>{entry.status}{entry.rttMs !== undefined ? ` ${entry.rttMs.toFixed(1)}ms` : ""}</span></div>)}
+          {routingRows.length > 0 ? routingRows : <p className="py-2 font-sans text-gray-400">No messages routed yet.</p>}
         </div>
       </div>
+
+      {showMessageTester && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          role="presentation"
+          onMouseDown={handleMessageTesterBackdrop}
+        >
+          <div className="w-full max-w-md rounded border border-yellow-300 bg-black p-4 text-white shadow-[0_0_24px_rgba(250,204,21,0.18)]">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold">Send Test Message</h3>
+                <p className="mt-1 text-xs text-gray-300">Send a ping through the laptop router to check that the selected XRP is reachable.</p>
+              </div>
+              <button className="rounded border border-gray-500 px-2 py-1 text-xs" onClick={closeMessageTester}>Close</button>
+            </div>
+            <label className="block text-sm">
+              Target
+              <select
+                className="mt-1 block w-full rounded border border-white bg-black p-2"
+                value={target}
+                onChange={(event) => setTarget(event.target.value)}
+              >
+                <option value={String(BROADCAST_ROBOT_ID)}>Broadcast</option>
+                {messageTargetOptions}
+              </select>
+            </label>
+            <button
+              className="mt-4 w-full rounded bg-yellow-300 px-3 py-2 font-semibold text-black disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!readyMessageTargets}
+              onClick={() => void sendTestMessage()}
+            >
+              Send message
+            </button>
+          </div>
+        </div>
+      )}
     </section>
+  );
+
+  return (
+    <SensorCard
+      title="Multi-Agent Lab"
+      icon={<FaProjectDiagram />}
+      onStart={() => {}}
+      onStop={() => {}}
+      isConnected={connectedIDERobots.length > 0}
+    >
+      <div className="absolute right-4 top-4">
+        <button
+          onClick={handleDelete}
+          className="rounded border border-red-400 bg-black p-2 text-red-300 transition hover:bg-red-500 hover:text-white"
+          title="Delete widget"
+          type="button"
+        >
+          <FaTrash size={12} />
+        </button>
+      </div>
+      {content}
+    </SensorCard>
   );
 }
