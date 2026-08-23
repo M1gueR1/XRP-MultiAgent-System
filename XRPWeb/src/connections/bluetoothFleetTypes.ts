@@ -2,6 +2,7 @@ import type { IDERobotRuntimeState } from './ideRobotTypes';
 
 export type BLERobotSessionState =
     | 'connecting'
+    | 'reconnecting'
     | 'initializing'
     | 'connected'
     | 'disconnected'

@@ -45,6 +45,7 @@ export default function MultiAgentLabWidget() {
   const [target, setTarget] = useState(String(BROADCAST_ROBOT_ID));
   const [showMessageTester, setShowMessageTester] = useState(false);
   const [showMultiEditorChoices, setShowMultiEditorChoices] = useState(false);
+  const [preparingBluetoothSessionId, setPreparingBluetoothSessionId] = useState<string | null>(null);
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
   const connectedIDERobots = [
@@ -137,6 +138,19 @@ export default function MultiAgentLabWidget() {
       setStatus(success);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const prepareUSBForBluetooth = async (sessionId: string, alias: string) => {
+    setPreparingBluetoothSessionId(sessionId);
+    setStatus(`Preparing ${alias} for faster Bluetooth team runs...`);
+    try {
+      await appMgr.prepareUSBRobotForBluetooth(sessionId);
+      setStatus(`${alias} is ready for Bluetooth. Disconnect its USB cable, connect it by Bluetooth, and run the team program.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPreparingBluetoothSessionId(null);
     }
   };
 
@@ -269,6 +283,7 @@ export default function MultiAgentLabWidget() {
               {session.error && <p className="mt-2 text-xs text-red-300">{session.error}</p>}
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
                 {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectUSBRobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
+                {session.state === "connected" && <button className="rounded-lg border border-cyan-300 px-2 py-1 text-cyan-100 transition hover:bg-cyan-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50" disabled={session.runtimeState !== "idle" || preparingBluetoothSessionId !== null} onClick={() => void prepareUSBForBluetooth(session.sessionId, session.alias)}>{preparingBluetoothSessionId === session.sessionId ? "Preparing..." : "Prepare for Bluetooth"}</button>}
                 {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectUSBRobot(session.sessionId), `${session.alias} reconnected.`)}>Reconnect</button>}
                 {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectUSBRobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
                 <button className="rounded-lg border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameUSBRobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>

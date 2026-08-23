@@ -273,6 +273,11 @@ export default class AppMgr {
         await this._connectionMgr.selectUSBRobot(sessionId);
     }
 
+    public async prepareUSBRobotForBluetooth(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.prepareUSBRobotForBluetooth(sessionId);
+    }
+
     public async reconnectUSBRobot(sessionId: string): Promise<void> {
         if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
         await this._connectionMgr.reconnectUSBRobot(sessionId);

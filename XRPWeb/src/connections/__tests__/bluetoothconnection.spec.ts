@@ -19,6 +19,22 @@ type MutableBluetoothConnection = {
 };
 
 describe('BluetoothConnection write reliability', () => {
+    it('bounds and retries the Raw REPL transition instead of waiting forever', async () => {
+        const writeValue = vi.fn(async () => undefined);
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Connected,
+            bleWriter: { writeValue },
+        });
+        const haltUntilRead = vi.spyOn(connection, 'haltUntilRead').mockResolvedValue([]);
+
+        await expect(connection.getToRaw()).rejects.toThrow(
+            'MicroPython Raw REPL did not respond after 2 attempts',
+        );
+        expect(haltUntilRead).toHaveBeenCalledTimes(2);
+        expect(writeValue).toHaveBeenCalledTimes(4);
+    });
+
     it('retries a transient REPL write before reporting an error', async () => {
         const writeValue = vi.fn()
             .mockRejectedValueOnce(new DOMException('GATT operation failed', 'NetworkError'))
@@ -31,6 +47,57 @@ describe('BluetoothConnection write reliability', () => {
 
         await expect(connection.writeToDevice('first')).resolves.toBeUndefined();
         expect(writeValue).toHaveBeenCalledTimes(2);
+    });
+
+    it('reconnects GATT and retries with a refreshed REPL characteristic after a disconnect', async () => {
+        const firstWrite = vi.fn(async () => {
+            gatt.connected = false;
+            throw new DOMException(
+                'GATT Server is disconnected. Cannot perform GATT operation. (Re)connect first.',
+                'NetworkError',
+            );
+        });
+        const recoveredWrite = vi.fn(async () => undefined);
+        const replReader = {
+            startNotifications: vi.fn(async () => replReader),
+            addEventListener: vi.fn(),
+        };
+        const service = {
+            getCharacteristic: vi.fn(async (uuid: string) => {
+                if (uuid.endsWith('0002-b5a3-f393-e0a9-e50e24dcca9e')) {
+                    return { writeValue: recoveredWrite };
+                }
+                if (uuid.endsWith('0003-b5a3-f393-e0a9-e50e24dcca9e')) return replReader;
+                throw new Error('Optional DATA characteristic unavailable');
+            }),
+        };
+        const server = {
+            getPrimaryService: vi.fn(async () => service),
+        };
+        const gatt = {
+            connected: true,
+            connect: vi.fn(async () => {
+                gatt.connected = true;
+                return server;
+            }),
+        };
+        const device = {
+            gatt,
+        };
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: true });
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Connected,
+            bleDevice: device,
+            bleWriter: { writeValue: firstWrite },
+            readWorkerRunning: true,
+            notificationStabilizationMs: 0,
+        });
+
+        await expect(connection.writeToDevice('first')).resolves.toBeUndefined();
+
+        expect(firstWrite).toHaveBeenCalledOnce();
+        expect(gatt.connect).toHaveBeenCalledOnce();
+        expect(recoveredWrite).toHaveBeenCalledOnce();
     });
 
     it('retries a transient DATA write before reporting an error', async () => {

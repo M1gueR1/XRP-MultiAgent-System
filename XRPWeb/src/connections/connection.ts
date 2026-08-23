@@ -41,6 +41,9 @@ abstract class Connection {
 
     // Set to something not "" to halt until this.READ_UNTIL_STRING found and collect lines in this.COLLECTED_DATA
     private readUntilStr = '';
+    private readUntilMatched = false;
+    private readonly replTransitionAttempts = 2;
+    private readonly replTransitionWaitPolls = 60;
 
     // ### MicroPython Control Commands ###
     // DOCS: https://docs.micropython.org/en/latest/esp8266/tutorial/this.html#other-control-commands
@@ -367,6 +370,7 @@ abstract class Connection {
 
     startReaduntil(str: string) {
         this.readUntilStr = str;
+        this.readUntilMatched = false;
         this.collectedData = '';
     }
 
@@ -396,6 +400,7 @@ abstract class Connection {
                         break;
                     }
                     this.readUntilStr = '';
+                    this.readUntilMatched = true;
 
                     // Output the rest of the lines that should not be hidden
                     // Should find a way to do this without adding newlines again
@@ -432,13 +437,30 @@ abstract class Connection {
     }
 
     async getToRaw() {
-        this.startReaduntil('raw REPL; CTRL-B to exit');
-        // Refer to pyboard.py for "\r" https://github.com/micropython/micropython/blob/master/tools/pyboard.py#L326-L334
-        await this.writeToDevice('\r' + this.CTRL_CMD_KINTERRUPT + this.CTRL_CMD_KINTERRUPT); // ctrl-C twice: interrupt any running program
-        await this.writeToDevice('\r' + this.CTRL_CMD_RAWMODE);
-        await this.haltUntilRead(2);
-
-        await this.softReset();
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= this.replTransitionAttempts; attempt += 1) {
+            try {
+                this.startReaduntil('raw REPL; CTRL-B to exit');
+                // Refer to pyboard.py for "\r" https://github.com/micropython/micropython/blob/master/tools/pyboard.py#L326-L334
+                await this.writeToDevice('\r' + this.CTRL_CMD_KINTERRUPT + this.CTRL_CMD_KINTERRUPT); // ctrl-C twice: interrupt any running program
+                await this.writeToDevice('\r' + this.CTRL_CMD_RAWMODE);
+                await this.haltUntilRead(2, this.replTransitionWaitPolls);
+                if (this.readUntilMatched) {
+                    await this.softReset();
+                    return;
+                }
+                lastError = new Error('The XRP did not answer the Raw REPL prompt.');
+            } catch (error) {
+                lastError = error;
+            }
+            if (attempt < this.replTransitionAttempts) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+        }
+        const detail = lastError instanceof Error ? lastError.message : String(lastError);
+        throw new Error(
+            `MicroPython Raw REPL did not respond after ${this.replTransitionAttempts} attempts: ${detail}`,
+        );
     }
 
     // Wait until an OK is received, else write ctrl-c since raw sometimes gets stuck? Seems to work for upload files
@@ -465,13 +487,35 @@ abstract class Connection {
     // https://github.com/micropython/micropython/blob/master/tools/pyboard.py#L325
     public async getToNormal(omitOffset: number = 0) {
         await this.getToRaw(); // Get to raw first so that unwanted messages are not printed (like another intro message)
+        await this.exitRawREPL(omitOffset);
+    }
 
-        //this.startReaduntil("Raspberry Pi Pico W with RP2040");
-        this.startReaduntil('MicroPython');
-        //this.startReaduntil("information.");
-        // https://github.com/micropython/micropython/blob/master/tools/pyboard.py#L360 for "\r"
-        await this.writeToDevice('\r' + this.CTRL_CMD_NORMALMODE);
-        await this.haltUntilRead(omitOffset);
+    private async exitRawREPL(omitOffset: number): Promise<void> {
+        let lastError: unknown;
+        for (let attempt = 1; attempt <= this.replTransitionAttempts; attempt += 1) {
+            try {
+                if (attempt > 1) {
+                    await this.getToRaw();
+                }
+                //this.startReaduntil("Raspberry Pi Pico W with RP2040");
+                this.startReaduntil('MicroPython');
+                //this.startReaduntil("information.");
+                // https://github.com/micropython/micropython/blob/master/tools/pyboard.py#L360 for "\r"
+                await this.writeToDevice('\r' + this.CTRL_CMD_NORMALMODE);
+                await this.haltUntilRead(omitOffset, this.replTransitionWaitPolls);
+                if (this.readUntilMatched) return;
+                lastError = new Error('The XRP did not answer the normal REPL prompt.');
+            } catch (error) {
+                lastError = error;
+            }
+            if (attempt < this.replTransitionAttempts) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+        }
+        const detail = lastError instanceof Error ? lastError.message : String(lastError);
+        throw new Error(
+            `MicroPython normal REPL did not respond after ${this.replTransitionAttempts} attempts: ${detail}`,
+        );
     }
 
 
@@ -569,9 +613,7 @@ abstract class Connection {
 
         //TODO: this.doPrintSeparator?.();
 
-        this.startReaduntil("MicroPython");
-        await this.writeToDevice("\r" + this.CTRL_CMD_NORMALMODE);
-        await this.haltUntilRead(3);
+        await this.exitRawREPL(3);
 
         // if they pushed the stop button while lines was executing
         if (this.STOP) {

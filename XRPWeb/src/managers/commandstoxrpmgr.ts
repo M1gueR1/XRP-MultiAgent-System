@@ -876,6 +876,26 @@ export class CommandToXRPMgr {
         }
     }
 
+    public async prepareForRun(): Promise<void> {
+        if (this.BUSY) {
+            throw new Error('The XRP is busy and cannot prepare to run a program.');
+        }
+        const connection = this.connection;
+        if (!connection?.isConnected()) {
+            throw new Error('No XRP is connected.');
+        }
+
+        this.BUSY = true;
+        try {
+            if (!(await connection.getToREPL())) {
+                throw new Error('The XRP did not enter the MicroPython REPL.');
+            }
+            await connection.getToNormal(3);
+        } finally {
+            this.BUSY = false;
+        }
+    }
+
     private async ensureDirectory(path: string): Promise<void> {
         if (!path || path === '/' || this.preparedDirectories.has(path)) return;
         await this.buildPath(path);

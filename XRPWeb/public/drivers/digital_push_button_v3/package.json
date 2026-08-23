@@ -1,0 +1,16 @@
+{
+  "urls": [
+    [
+      "digital_push_button_v3.py",
+      "drivers/digital_push_button_v3/digital_push_button_v3.py"
+    ]
+  ],
+  "blocks": [
+    {
+      "friendly_name": "Digital Push Button V3",
+      "blocks_url": "drivers/digital_push_button_v3/blocks.json",
+      "script_url": "drivers/digital_push_button_v3/blocks.js"
+    }
+  ],
+  "version": "1.1.0"
+}

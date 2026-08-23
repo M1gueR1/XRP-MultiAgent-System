@@ -10,6 +10,157 @@ function deferred() {
 }
 
 describe('ConnectionMgr session-bound runs', () => {
+    it('prepares multi-robot targets sequentially and launches only after every target is ready', async () => {
+        const order: string[] = [];
+        const makeCommands = (alias: string) => ({
+            BUSY: false,
+            prepareForRun: vi.fn(async () => { order.push(`prepare-${alias}`); }),
+            uploadFile: vi.fn(async () => { order.push(`upload-${alias}`); }),
+            verifyUploadedFiles: vi.fn(async () => { order.push(`verify-${alias}`); }),
+            updateMainFile: vi.fn(async () => {
+                order.push(`main-${alias}`);
+                return `print("${alias}")`;
+            }),
+            executeLines: vi.fn(async () => { order.push(`execute-${alias}`); }),
+        });
+        const connection = { isConnected: () => true };
+        const firstCommands = makeCommands('a');
+        const secondCommands = makeCommands('b');
+        const first = {
+            sessionId: 'usb-a',
+            alias: 'XRP A',
+            connection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            commands: firstCommands,
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const second = {
+            ...first,
+            sessionId: 'usb-b',
+            alias: 'XRP B',
+            commands: secondCommands,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([
+                [first.sessionId, first],
+                [second.sessionId, second],
+            ]),
+            bleSessions: new Map(),
+            activeUSBSessionId: null,
+            activeBLESessionId: null,
+            activeConnection: null,
+        });
+
+        await manager.runProgramOnRobots(
+            [first.sessionId, second.sessionId],
+            '/shared.py',
+            'print("shared")',
+        );
+
+        expect(order).toEqual([
+            'prepare-a',
+            'prepare-b',
+            'upload-a',
+            'verify-a',
+            'main-a',
+            'upload-b',
+            'verify-b',
+            'main-b',
+            'execute-a',
+            'execute-b',
+        ]);
+    });
+
+    it('coalesces concurrent BLE initialization callbacks into one initialization', async () => {
+        const initialization = deferred();
+        const performInitialization = vi.fn(() => initialization.promise);
+        const record = {
+            initializationPromise: undefined as Promise<void> | undefined,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            performBLESessionInitialization: performInitialization,
+        });
+        const initialize = (
+            manager as unknown as {
+                initializeBLESession: (session: typeof record) => Promise<void>;
+            }
+        ).initializeBLESession.bind(manager);
+
+        const first = initialize(record);
+        const second = initialize(record);
+        await Promise.resolve();
+
+        expect(performInitialization).toHaveBeenCalledOnce();
+        initialization.resolve();
+        await Promise.all([first, second]);
+        expect(record.initializationPromise).toBeUndefined();
+    });
+
+    it('keeps the active IDE session and files visible while GATT is automatically reconnecting', async () => {
+        const { BluetoothConnection } = await import('@/connections/bluetoothconnection');
+        const { ConnectionState } = await import('@/connections/connection');
+        const { ConnectionType } = await import('@/utils/types');
+        const connection = Object.create(
+            BluetoothConnection.prototype,
+        ) as InstanceType<typeof BluetoothConnection>;
+        vi.spyOn(connection, 'isRecovering').mockReturnValue(true);
+        const record = {
+            sessionId: 'ble-recovering',
+            alias: 'XRP B',
+            connection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: false,
+            resumeActive: false,
+            terminalBuffer: 'Receiver ready\r\n',
+            filesystemCache: '{"name":"/"}',
+            commands: {},
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const emit = vi.fn();
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit },
+            usbSessions: new Map(),
+            bleSessions: new Map([[record.sessionId, record]]),
+            activeUSBSessionId: null,
+            activeBLESessionId: record.sessionId,
+            activeConnection: connection,
+        });
+
+        await manager.connectCallback(
+            ConnectionState.Disconnected,
+            ConnectionType.BLUETOOTH,
+            connection,
+        );
+
+        expect(record.state).toBe('reconnecting');
+        expect(record.resumeActive).toBe(true);
+        expect((manager as unknown as { activeBLESessionId: string | null }).activeBLESessionId)
+            .toBe(record.sessionId);
+        expect((
+            manager as unknown as {
+                activeConnection: InstanceType<typeof BluetoothConnection> | null;
+            }
+        ).activeConnection)
+            .toBe(connection);
+        expect(emit).not.toHaveBeenCalledWith(expect.anything(), '{}');
+    });
+
     it('keeps terminal history available across repeated IDE switches', async () => {
         const first = {
             sessionId: 'usb-b',
@@ -408,5 +559,115 @@ describe('ConnectionMgr session-bound runs', () => {
         expect(commands.uploadFile).not.toHaveBeenCalled();
         expect(bluetooth.multiAgentLibraryInstalled).toBe(true);
         expect(bluetooth.teamTransportConfigured).toBe(true);
+    });
+
+    it('preloads the Bluetooth team library over USB without preparing or running main.py', async () => {
+        const commands = {
+            BUSY: false,
+            uploadFileBatch: vi.fn(async (
+                _files: ReadonlyArray<{ path: string; content: string | Uint8Array }>,
+            ) => undefined),
+            uploadFile: vi.fn(async () => undefined),
+            verifyUploadedFiles: vi.fn()
+                .mockRejectedValueOnce(new Error('bundle manifest missing'))
+                .mockResolvedValue(undefined),
+            updateMainFile: vi.fn(async () => ''),
+            executeLines: vi.fn(async () => undefined),
+        };
+        const usb = {
+            sessionId: 'usb-preload',
+            alias: 'XRP A',
+            connection: {
+                isConnected: () => true,
+                hasRuntimeDataChannel: () => true,
+            },
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            error: undefined as string | undefined,
+            commands,
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([[usb.sessionId, usb]]),
+            bleSessions: new Map(),
+            activeUSBSessionId: usb.sessionId,
+            activeBLESessionId: null,
+        });
+
+        await manager.prepareUSBRobotForBluetooth(usb.sessionId);
+
+        expect(commands.uploadFileBatch).toHaveBeenCalledOnce();
+        expect(commands.uploadFileBatch.mock.calls[0][0]).toContainEqual({
+            path: '/lib/MultiAgentLib/_transport_config.py',
+            content: 'TRANSPORT = "bluetooth_uart"\n',
+        });
+        expect(commands.updateMainFile).not.toHaveBeenCalled();
+        expect(commands.executeLines).not.toHaveBeenCalled();
+        expect(usb.multiAgentLibraryInstalled).toBe(true);
+        expect(usb.teamTransportConfigured).toBe(true);
+        expect((usb as typeof usb & { teamTransportMode?: string }).teamTransportMode).toBe('bluetooth_uart');
+    });
+
+    it('switches the cached transport configuration when moving between Bluetooth preparation and USB runs', async () => {
+        const commands = {
+            BUSY: false,
+            uploadFileBatch: vi.fn(async () => undefined),
+            uploadFile: vi.fn(async () => undefined),
+            verifyUploadedFiles: vi.fn(async () => undefined),
+        };
+        const usb = {
+            sessionId: 'usb-transport-switch',
+            alias: 'XRP A',
+            connection: {
+                isConnected: () => true,
+                hasRuntimeDataChannel: () => true,
+            },
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            commands,
+            multiAgentLibraryInstalled: true,
+            teamTransportConfigured: true,
+            teamTransportMode: 'usb',
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([[usb.sessionId, usb]]),
+            bleSessions: new Map(),
+            activeUSBSessionId: usb.sessionId,
+            activeBLESessionId: null,
+        });
+
+        await manager.prepareUSBRobotForBluetooth(usb.sessionId);
+        await (
+            manager as unknown as {
+                prepareTeamCommunication: (sessionIds: string[]) => Promise<void>;
+            }
+        ).prepareTeamCommunication([usb.sessionId]);
+
+        expect(commands.uploadFile).toHaveBeenNthCalledWith(
+            1,
+            '/lib/MultiAgentLib/_transport_config.py',
+            'TRANSPORT = "bluetooth_uart"\n',
+            false,
+        );
+        expect(commands.uploadFile).toHaveBeenNthCalledWith(
+            2,
+            '/lib/MultiAgentLib/_transport_config.py',
+            'TRANSPORT = "usb"\n',
+            false,
+        );
+        expect(usb.teamTransportMode).toBe('usb');
     });
 });

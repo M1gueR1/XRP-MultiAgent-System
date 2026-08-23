@@ -1,0 +1,18 @@
+[
+  {
+    "kind": "BLOCK",
+    "type": "digital_push_button_v3_pressed"
+  },
+  {
+    "kind": "BLOCK",
+    "type": "digital_push_button_v3_value"
+  },
+  {
+    "kind": "BLOCK",
+    "type": "digital_push_button_v3_wait_press"
+  },
+  {
+    "kind": "BLOCK",
+    "type": "digital_push_button_v3_wait_release"
+  }
+]

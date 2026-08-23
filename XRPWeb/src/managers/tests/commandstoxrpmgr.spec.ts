@@ -11,6 +11,22 @@ function deferred<T>() {
 }
 
 describe('CommandToXRPMgr session isolation', () => {
+    it('prepares a cold XRP REPL and always releases the busy lock', async () => {
+        const connection = {
+            isConnected: () => true,
+            getToREPL: vi.fn(async () => true),
+            getToNormal: vi.fn(async () => undefined),
+        } as unknown as Connection;
+        const commands = new CommandToXRPMgr(false);
+        commands.setConnection(connection);
+
+        await commands.prepareForRun();
+
+        expect(connection.getToREPL).toHaveBeenCalledOnce();
+        expect(connection.getToNormal).toHaveBeenCalledWith(3);
+        expect(commands.BUSY).toBe(false);
+    });
+
     it('finishes a battery check on the connection where it started', async () => {
         const result = deferred<string[]>();
         const first = {
