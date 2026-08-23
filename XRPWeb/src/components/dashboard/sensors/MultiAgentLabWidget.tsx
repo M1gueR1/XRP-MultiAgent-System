@@ -10,13 +10,29 @@ import {
 import AppMgr, { EventType } from "@/managers/appmgr";
 import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import type { BLERobotFleetSnapshot } from "@/connections/bluetoothFleetTypes";
-import type { IDERobotRuntimeState, MultiRobotEditorRequest } from "@/connections/ideRobotTypes";
+import type { IDERobotRuntimeState, MultiRobotEditorRequest, PreferredRobotProgramRequest } from "@/connections/ideRobotTypes";
 import { useGridStackWidget } from "../hooks/useGridStackWidget";
 import SensorCard from "./SensorCard";
 
 const fleet = getRobotFleetManager();
 const appMgr = AppMgr.getInstance();
 const INITIAL_STATUS = "Ready. Add each cable-connected XRP, then choose which robot owns the IDE files.";
+const PREFERRED_PROGRAMS_STORAGE_KEY = "xrp-multiagent-preferred-programs-v1";
+
+function readPreferredPrograms(): Record<string, string> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PREFERRED_PROGRAMS_STORAGE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePreferredPrograms(programs: Record<string, string>): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(PREFERRED_PROGRAMS_STORAGE_KEY, JSON.stringify(programs));
+}
 
 function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
   const title = state === "idle"
@@ -46,11 +62,22 @@ export default function MultiAgentLabWidget() {
   const [showMessageTester, setShowMessageTester] = useState(false);
   const [showMultiEditorChoices, setShowMultiEditorChoices] = useState(false);
   const [preparingBluetoothSessionId, setPreparingBluetoothSessionId] = useState<string | null>(null);
+  const [preferredPrograms, setPreferredPrograms] = useState<Record<string, string>>(() => readPreferredPrograms());
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
   const connectedIDERobots = [
-    ...usbSnapshot.sessions.filter((session) => session.state === "connected").map((session) => ({ sessionId: session.sessionId, alias: session.alias })),
-    ...bleIDESnapshot.sessions.filter((session) => session.state === "connected").map((session) => ({ sessionId: session.sessionId, alias: session.alias })),
+    ...usbSnapshot.sessions.filter((session) => session.state === "connected").map((session) => ({
+      sessionId: session.sessionId,
+      alias: session.alias,
+      runtimeState: session.runtimeState,
+      programFiles: session.programFiles,
+    })),
+    ...bleIDESnapshot.sessions.filter((session) => session.state === "connected").map((session) => ({
+      sessionId: session.sessionId,
+      alias: session.alias,
+      runtimeState: session.runtimeState,
+      programFiles: session.programFiles,
+    })),
   ];
 
   useEffect(() => {
@@ -214,6 +241,44 @@ export default function MultiAgentLabWidget() {
     setStatus(`Multi-XRP ${fileType} tab created for ${connectedIDERobots.length} robots. Its Run button is purple.`);
   };
 
+  const updatePreferredProgram = (sessionId: string, path: string) => {
+    setPreferredPrograms((current) => {
+      const next = { ...current };
+      if (path) next[sessionId] = path;
+      else delete next[sessionId];
+      writePreferredPrograms(next);
+      return next;
+    });
+  };
+
+  const runPreferredPrograms = async () => {
+    const missing = connectedIDERobots.filter((robot) => {
+      const selected = preferredPrograms[robot.sessionId];
+      return !selected || !robot.programFiles.includes(selected);
+    });
+    if (connectedIDERobots.length === 0) {
+      setStatus("Connect at least one XRP before running preferred programs.");
+      return;
+    }
+    if (missing.length > 0) {
+      setStatus(`Choose a preferred Python file for ${missing.map((robot) => robot.alias).join(", ")}.`);
+      return;
+    }
+    const requests: PreferredRobotProgramRequest[] = connectedIDERobots.map((robot) => ({
+      sessionId: robot.sessionId,
+      path: preferredPrograms[robot.sessionId],
+    }));
+    await run(
+      () => appMgr.runPreferredProgramsOnRobots(requests),
+      `Started preferred programs on ${requests.length} XRP${requests.length === 1 ? "" : "s"}.`,
+    );
+  };
+
+  const canRunPreferredPrograms = connectedIDERobots.length > 0 && connectedIDERobots.every((robot) => {
+    const selected = preferredPrograms[robot.sessionId];
+    return Boolean(selected) && robot.programFiles.includes(selected) && robot.runtimeState === "idle";
+  });
+
   const messageTargetOptions = snapshot.sessions
     .filter((session) => session.robotId !== undefined)
     .map((session) => (
@@ -258,6 +323,46 @@ export default function MultiAgentLabWidget() {
             <span className="text-xs text-gray-300">Targets: {connectedIDERobots.map((robot) => robot.alias).join(", ")}</span>
           </div>
         )}
+        <div className="mt-3 border-t border-purple-400/60 pt-3">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <h3 className="mr-auto text-sm font-semibold text-purple-100">Preferred programs</h3>
+            <button
+              className="rounded-lg border border-purple-300 bg-black px-3 py-2 font-bold text-white transition hover:bg-purple-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!canRunPreferredPrograms}
+              onClick={() => void runPreferredPrograms()}
+            >
+              Run preferred programs
+            </button>
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {connectedIDERobots.map((robot) => {
+              const selected = preferredPrograms[robot.sessionId];
+              const value = selected && robot.programFiles.includes(selected) ? selected : "";
+              return (
+                <label key={robot.sessionId} className="grid gap-1 text-xs text-gray-200">
+                  <span className="flex items-center gap-2">
+                    <RuntimeDot state={robot.runtimeState} />
+                    <strong>{robot.alias}</strong>
+                  </span>
+                  <select
+                    className="w-full rounded border border-purple-300 bg-black p-2 text-white disabled:opacity-50"
+                    value={value}
+                    disabled={robot.programFiles.length === 0 || robot.runtimeState !== "idle"}
+                    onChange={(event) => updatePreferredProgram(robot.sessionId, event.target.value)}
+                  >
+                    <option value="">{robot.programFiles.length === 0 ? "No Python files found" : "Select Python file"}</option>
+                    {robot.programFiles.map((path) => (
+                      <option key={path} value={path}>{path}</option>
+                    ))}
+                  </select>
+                </label>
+              );
+            })}
+            {connectedIDERobots.length === 0 && (
+              <p className="text-xs text-yellow-300">Connect an XRP in the USB or Bluetooth IDE fleet.</p>
+            )}
+          </div>
+        </div>
       </div>
 
       <div className="grid gap-3 xl:grid-cols-2">

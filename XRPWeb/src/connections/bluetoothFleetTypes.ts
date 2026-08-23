@@ -16,6 +16,7 @@ export interface BLERobotSessionSnapshot {
     active: boolean;
     deviceName?: string;
     browserDeviceId?: string;
+    programFiles: string[];
     lastRunStartedAt?: number;
     lastRunFinishedAt?: number;
     error?: string;

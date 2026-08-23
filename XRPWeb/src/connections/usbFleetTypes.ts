@@ -15,6 +15,7 @@ export interface USBRobotSessionSnapshot {
     active: boolean;
     usbVendorId?: number;
     usbProductId?: number;
+    programFiles: string[];
     lastRunStartedAt?: number;
     lastRunFinishedAt?: number;
     error?: string;

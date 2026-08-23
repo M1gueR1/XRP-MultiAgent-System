@@ -23,3 +23,8 @@ export interface MultiRobotSaveRequest {
     editorId: string;
     code: string;
 }
+
+export interface PreferredRobotProgramRequest {
+    sessionId: string;
+    path: string;
+}

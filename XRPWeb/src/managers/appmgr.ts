@@ -19,6 +19,7 @@ import type {
     IDERobotRunPreflight,
     IDERobotRuntimeState,
     IDERobotTargetSnapshot,
+    PreferredRobotProgramRequest,
 } from '@/connections/ideRobotTypes';
 
 export enum Themes {
@@ -404,6 +405,11 @@ export default class AppMgr {
     public async runProgramOnRobots(sessionIds: string[], path: string, content: string): Promise<void> {
         if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
         await this._connectionMgr.runProgramOnRobots(sessionIds, path, content);
+    }
+
+    public async runPreferredProgramsOnRobots(requests: PreferredRobotProgramRequest[]): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.runPreferredProgramsOnRobots(requests);
     }
 
     public async stopProgramsOnRobots(sessionIds: string[]): Promise<void> {

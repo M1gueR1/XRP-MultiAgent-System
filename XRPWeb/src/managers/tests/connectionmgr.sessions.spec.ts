@@ -79,6 +79,87 @@ describe('ConnectionMgr session-bound runs', () => {
         ]);
     });
 
+    it('runs each selected preferred program without uploading shared editor content', async () => {
+        const order: string[] = [];
+        const makeCommands = (alias: string) => ({
+            BUSY: false,
+            prepareForRun: vi.fn(async () => { order.push(`prepare-${alias}`); }),
+            getFileContents: vi.fn(async () => {
+                order.push(`read-${alias}`);
+                return Array.from(new TextEncoder().encode(`print("${alias}")`));
+            }),
+            uploadFile: vi.fn(async () => { order.push(`upload-${alias}`); }),
+            updateMainFile: vi.fn(async (path: string) => {
+                order.push(`main-${alias}:${path}`);
+                return `print("${alias}")`;
+            }),
+            executeLines: vi.fn(async () => { order.push(`execute-${alias}`); }),
+        });
+        const connection = { isConnected: () => true };
+        const firstCommands = makeCommands('a');
+        const secondCommands = makeCommands('b');
+        const first = {
+            sessionId: 'usb-a',
+            alias: 'XRP A',
+            connection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            filesystemCache: JSON.stringify([{
+                name: '/',
+                path: '/',
+                children: [{ name: 'a.py', path: '/', children: null }],
+            }]),
+            commands: firstCommands,
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const second = {
+            ...first,
+            sessionId: 'usb-b',
+            alias: 'XRP B',
+            filesystemCache: JSON.stringify([{
+                name: '/',
+                path: '/',
+                children: [{ name: 'b.py', path: '/', children: null }],
+            }]),
+            commands: secondCommands,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([
+                [first.sessionId, first],
+                [second.sessionId, second],
+            ]),
+            bleSessions: new Map(),
+            activeUSBSessionId: null,
+            activeBLESessionId: null,
+            activeConnection: null,
+        });
+
+        await manager.runPreferredProgramsOnRobots([
+            { sessionId: first.sessionId, path: '/a.py' },
+            { sessionId: second.sessionId, path: '/b.py' },
+        ]);
+
+        expect(firstCommands.uploadFile).not.toHaveBeenCalled();
+        expect(secondCommands.uploadFile).not.toHaveBeenCalled();
+        expect(order).toEqual([
+            'prepare-a',
+            'prepare-b',
+            'read-a',
+            'read-b',
+            'main-a:/a.py',
+            'main-b:/b.py',
+            'execute-a',
+            'execute-b',
+        ]);
+    });
+
     it('coalesces concurrent BLE initialization callbacks into one initialization', async () => {
         const initialization = deferred();
         const performInitialization = vi.fn(() => initialization.promise);

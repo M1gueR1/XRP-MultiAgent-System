@@ -19,6 +19,7 @@ import type {
     IDERobotRunPreflight,
     IDERobotRuntimeState,
     IDERobotTargetSnapshot,
+    PreferredRobotProgramRequest,
 } from '@/connections/ideRobotTypes';
 import {
     BluetoothIDETransport,
@@ -74,6 +75,12 @@ interface BLERobotSessionRecord {
 }
 
 type IDERobotSessionRecord = USBRobotSessionRecord | BLERobotSessionRecord;
+
+interface RobotFilesystemNode {
+    name: string;
+    path: string;
+    children: RobotFilesystemNode[] | null;
+}
 
 /**
  * Owns the legacy active connection and the USB fleet. Only one fleet member is
@@ -226,6 +233,7 @@ export default class ConnectionMgr {
             active: record.sessionId === this.activeUSBSessionId,
             usbVendorId: record.usbVendorId,
             usbProductId: record.usbProductId,
+            programFiles: this.getProgramFilesForRecord(record),
             lastRunStartedAt: record.lastRunStartedAt,
             lastRunFinishedAt: record.lastRunFinishedAt,
             error: record.error,
@@ -372,6 +380,7 @@ export default class ConnectionMgr {
             active: record.sessionId === this.activeBLESessionId,
             deviceName: record.deviceName,
             browserDeviceId: record.browserDeviceId,
+            programFiles: this.getProgramFilesForRecord(record),
             lastRunStartedAt: record.lastRunStartedAt,
             lastRunFinishedAt: record.lastRunFinishedAt,
             error: record.error,
@@ -560,6 +569,96 @@ export default class ConnectionMgr {
             const detail = error instanceof Error ? error.message : String(error);
             const aliases = records.map((record) => record.alias).join(', ') || 'XRP';
             const message = `${aliases} Run failed while ${phase}: ${detail}`;
+            for (const record of records) record.error = message;
+            this.emitUSBFleet();
+            this.emitBLEFleet();
+            throw new Error(message);
+        } finally {
+            for (const record of records) {
+                if (record.runtimeState !== 'idle') this.setRobotRuntimeState(record, 'idle');
+            }
+        }
+    }
+
+    public async runPreferredProgramsOnRobots(requests: PreferredRobotProgramRequest[]): Promise<void> {
+        const normalizedRequests = this.normalizePreferredProgramRequests(requests);
+        const targets = this.resolveCommandTargets(normalizedRequests.map((request) => request.sessionId));
+        const pathBySessionId = new Map(normalizedRequests.map((request) => [request.sessionId, request.path]));
+        const records = targets.flatMap(({ sessionId }) => {
+            const record = this.getRobotRecord(sessionId);
+            return record ? [record] : [];
+        });
+        for (const record of records) {
+            record.error = undefined;
+            this.setRobotRuntimeState(record, 'starting');
+        }
+
+        let phase = 'preparing the preferred program run';
+        try {
+            if (targets.length > 1) {
+                for (const { sessionId, commands } of targets) {
+                    const record = this.getRobotRecord(sessionId);
+                    phase = `preparing ${record?.alias ?? sessionId} for the run`;
+                    await commands.prepareForRun();
+                }
+            }
+
+            const sourceBySessionId = new Map<string, string>();
+            for (const { sessionId, commands } of targets) {
+                const path = pathBySessionId.get(sessionId)!;
+                const record = this.getRobotRecord(sessionId);
+                phase = `reading ${path} on ${record?.alias ?? sessionId}`;
+                const bytes = await commands.getFileContents(path);
+                sourceBySessionId.set(sessionId, new TextDecoder().decode(new Uint8Array(bytes)));
+            }
+
+            const usesTeamCommunication = [...sourceBySessionId.values()].some(programUsesTeamCommunication);
+            if (usesTeamCommunication) {
+                phase = 'checking the team communication library';
+                await this.prepareTeamCommunication(normalizedRequests.map((request) => request.sessionId));
+            }
+
+            const executionPlans: Array<{
+                sessionId: string;
+                commands: CommandToXRPMgr;
+                lines: string;
+            }> = [];
+            for (const { sessionId, commands } of targets) {
+                const path = pathBySessionId.get(sessionId)!;
+                const record = this.getRobotRecord(sessionId);
+                phase = `preparing ${path} on ${record?.alias ?? sessionId}`;
+                executionPlans.push({
+                    sessionId,
+                    commands,
+                    lines: await commands.updateMainFile(path, false),
+                });
+            }
+
+            if (usesTeamCommunication) {
+                phase = 'starting the team coordinator';
+                await this.prepareTeamRuntime(normalizedRequests.map((request) => request.sessionId));
+            }
+
+            phase = 'executing preferred programs';
+            await Promise.all(executionPlans.map(async ({ sessionId, commands, lines }) => {
+                const record = this.getRobotRecord(sessionId);
+                if (record) this.setRobotRuntimeState(record, 'running');
+                try {
+                    await commands.executeLines(lines, { refreshFilesystem: false, emitProgramExecuted: false });
+                } finally {
+                    if (record) this.setRobotRuntimeState(record, 'idle');
+                }
+            }));
+
+            if (normalizedRequests.some((request) => request.sessionId === this.getActiveRobotSessionId())) {
+                phase = 'refreshing the XRP filesystem';
+                const active = this.getActiveRobotRecord();
+                if (active) await this.refreshFilesystemForRecord(active);
+            }
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const aliases = records.map((record) => record.alias).join(', ') || 'XRP';
+            const message = `${aliases} Preferred run failed while ${phase}: ${detail}`;
             for (const record of records) record.error = message;
             this.emitUSBFleet();
             this.emitBLEFleet();
@@ -1057,6 +1156,58 @@ export default class ConnectionMgr {
         if (record.filesystemCache) {
             this.appMgr.emit(EventType.EVENT_FILESYS, record.filesystemCache);
         }
+    }
+
+    private getProgramFilesForRecord(record: IDERobotSessionRecord): string[] {
+        if (!record.filesystemCache) return [];
+        try {
+            const roots = JSON.parse(record.filesystemCache) as RobotFilesystemNode[];
+            const files: string[] = [];
+            const visit = (node: RobotFilesystemNode) => {
+                if (node.children === null) {
+                    const filePath = node.path === '/' ? `/${node.name}` : `${node.path}/${node.name}`;
+                    if (filePath.endsWith('.py') && filePath !== '/main.py') files.push(filePath);
+                    return;
+                }
+                for (const child of node.children ?? []) visit(child);
+            };
+            for (const root of roots) visit(root);
+            return [...new Set(files)].sort((first, second) => first.localeCompare(second));
+        } catch {
+            return [];
+        }
+    }
+
+    private normalizePreferredProgramRequests(requests: PreferredRobotProgramRequest[]): PreferredRobotProgramRequest[] {
+        const normalized = requests.map((request) => ({
+            sessionId: request.sessionId,
+            path: this.normalizeRobotProgramPath(request.path),
+        }));
+        if (normalized.length === 0) throw new Error('Choose at least one preferred XRP program.');
+        const seen = new Set<string>();
+        for (const request of normalized) {
+            if (seen.has(request.sessionId)) {
+                throw new Error('Each XRP can only have one preferred program in a run.');
+            }
+            seen.add(request.sessionId);
+            const record = this.getRobotRecord(request.sessionId);
+            if (!record) throw new Error(`Unknown XRP session: ${request.sessionId}`);
+            const files = this.getProgramFilesForRecord(record);
+            if (files.length > 0 && !files.includes(request.path)) {
+                throw new Error(`${record.alias} does not list ${request.path}. Refresh its filesystem and choose again.`);
+            }
+        }
+        return normalized;
+    }
+
+    private normalizeRobotProgramPath(path: string): string {
+        const normalized = path.trim();
+        if (!normalized) throw new Error('Preferred program path cannot be empty.');
+        if (normalized.includes('\r') || normalized.includes('\n') || normalized.includes("'")) {
+            throw new Error('Preferred program path contains unsupported characters.');
+        }
+        if (!normalized.endsWith('.py')) throw new Error('Preferred programs must be Python files.');
+        return normalized.startsWith('/') ? normalized : `/${normalized}`;
     }
 
     private routeOutputToBuffer(record: IDERobotSessionRecord): void {
