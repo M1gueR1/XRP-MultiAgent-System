@@ -336,6 +336,20 @@ export default class AppMgr {
         this._connectionMgr?.appendRobotTerminalBuffer(sessionId, data);
     }
 
+    public getRobotTerminalBuffer(sessionId: string): string {
+        return this._connectionMgr?.getRobotTerminalBuffer(sessionId) ?? '';
+    }
+
+    public subscribeRobotTerminal(sessionId: string, listener: (data: string) => void): () => void {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        return this._connectionMgr.subscribeRobotTerminal(sessionId, listener);
+    }
+
+    public writeRobotTerminalData(sessionId: string, data: string): void {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        this._connectionMgr.writeRobotTerminalData(sessionId, data);
+    }
+
     public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {
         this._connectionMgr?.markActiveRobotRuntimeState(runtimeState);
     }

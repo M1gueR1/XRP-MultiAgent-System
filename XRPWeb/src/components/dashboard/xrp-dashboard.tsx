@@ -16,6 +16,7 @@ import CustomEmotionKeywordsWidget from "./sensors/CustomEmotionKeywordsWidget";
 import CustomXPPSensor from "./sensors/CustomXPPSensor";
 import CustomVariableWidget from "./sensors/CustomVariableWidget";
 import MultiAgentLabWidget from "./sensors/MultiAgentLabWidget";
+import XRPTerminalWidget from "./sensors/XRPTerminalWidget";
 import { getCustomSensor } from "./sensors/customRegistry";
 import { GridStackOptions } from "gridstack";
 import AddWidgets from "./AddWidget";
@@ -42,7 +43,6 @@ const BREAKPOINTS = [
 ];
 
 // ─── Component Map ──────────────────────────────────────────────
-
 const COMPONENT_MAP = {
   Accelerometer: () => <Accelerometer />,
   Gyroscope: () => <Gyroscope />,
@@ -57,6 +57,9 @@ const COMPONENT_MAP = {
   RobotChatWidget: () => <RobotChatWidget />,
   CustomEmotionKeywordsWidget: () => <CustomEmotionKeywordsWidget />,
   MultiAgentLabWidget: () => <MultiAgentLabWidget />,
+  XRPTerminalWidget: ({ sessionId, alias }: { sessionId: string; alias: string }) => (
+    <XRPTerminalWidget sessionId={sessionId} alias={alias} />
+  ),
   CustomSensor: ({ sensorName }: { sensorName: string }) => {
     const def = getCustomSensor(sensorName);
     if (!def) {
@@ -75,7 +78,6 @@ const COMPONENT_MAP = {
       />
     );
   },
-
   CustomVariable: ({ initialVarName }: { initialVarName?: string }) => (
     <CustomVariableWidget initialVarName={initialVarName} />
   ),
@@ -149,7 +151,6 @@ function DashboardHeader() {
             <FaBug size={18} />
           </button>
         )}
-
         <button
           onClick={handleReset}
           className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700 rounded transition-colors duration-200"

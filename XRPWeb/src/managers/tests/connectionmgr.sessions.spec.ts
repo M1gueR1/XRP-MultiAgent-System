@@ -122,7 +122,7 @@ describe('ConnectionMgr session-bound runs', () => {
             filesystemCache: JSON.stringify([{
                 name: '/',
                 path: '/',
-                children: [{ name: 'b.py', path: '/', children: null }],
+                children: [{ name: 'b.blocks', path: '/', children: null }],
             }]),
             commands: secondCommands,
         };
@@ -143,7 +143,7 @@ describe('ConnectionMgr session-bound runs', () => {
 
         await manager.runPreferredProgramsOnRobots([
             { sessionId: first.sessionId, path: '/a.py' },
-            { sessionId: second.sessionId, path: '/b.py' },
+            { sessionId: second.sessionId, path: '/b.blocks' },
         ]);
 
         expect(firstCommands.uploadFile).not.toHaveBeenCalled();
@@ -154,9 +154,66 @@ describe('ConnectionMgr session-bound runs', () => {
             'read-a',
             'read-b',
             'main-a:/a.py',
-            'main-b:/b.py',
+            'main-b:/b.blocks',
             'execute-a',
             'execute-b',
+        ]);
+    });
+
+    it('lists Python and Blockly programs from nested XRP filesystem folders', async () => {
+        const record = {
+            sessionId: 'usb-a',
+            alias: 'XRP A',
+            connection: { isConnected: () => true },
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            filesystemCache: JSON.stringify([{
+                name: '/',
+                path: '/',
+                children: [
+                    { name: 'main.py', path: '/', children: null },
+                    { name: 'root.blocks', path: '/', children: null },
+                    { name: 'notes.txt', path: '/', children: null },
+                    {
+                        name: 'lib',
+                        path: '/',
+                        children: [
+                            { name: 'helper.py', path: '/lib', children: null },
+                            { name: 'team.blocks', path: '/lib', children: null },
+                            {
+                                name: 'nested',
+                                path: '/lib',
+                                children: [
+                                    { name: 'deep.py', path: '/lib/nested', children: null },
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            }]),
+            commands: { BUSY: false },
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([[record.sessionId, record]]),
+            bleSessions: new Map(),
+            activeUSBSessionId: null,
+            activeBLESessionId: null,
+            activeConnection: null,
+        });
+
+        expect(manager.getUSBFleetSnapshot().sessions[0].programFiles).toEqual([
+            '/lib/helper.py',
+            '/lib/nested/deep.py',
+            '/lib/team.blocks',
+            '/root.blocks',
         ]);
     });
 
@@ -312,6 +369,128 @@ describe('ConnectionMgr session-bound runs', () => {
 
         expect(receiver.terminalBuffer).toContain('Receiver message');
         expect(sender.terminalBuffer).toBe('');
+    });
+
+    it('keeps terminal widget subscriptions isolated by XRP session', async () => {
+        const connection = {
+            isConnected: () => true,
+            isBusy: () => false,
+            writeToDevice: vi.fn(),
+        };
+        const first = {
+            sessionId: 'usb-a',
+            alias: 'XRP A',
+            connection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: 'A history\r\n',
+            commands: {},
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const second = {
+            ...first,
+            sessionId: 'usb-b',
+            alias: 'XRP B',
+            connection: {
+                isConnected: () => true,
+                isBusy: () => false,
+                writeToDevice: vi.fn(),
+            },
+            terminalBuffer: 'B history\r\n',
+        };
+
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map([
+                [first.sessionId, first],
+                [second.sessionId, second],
+            ]),
+            bleSessions: new Map(),
+            activeUSBSessionId: second.sessionId,
+            activeBLESessionId: null,
+            activeConnection: second.connection,
+            terminalListeners: new Map(),
+        });
+
+        const firstOutput: string[] = [];
+        const secondOutput: string[] = [];
+        const unsubscribeFirst = manager.subscribeRobotTerminal(first.sessionId, (data) => firstOutput.push(data));
+        const unsubscribeSecond = manager.subscribeRobotTerminal(second.sessionId, (data) => secondOutput.push(data));
+
+        expect(manager.getRobotTerminalBuffer(first.sessionId)).toBe('A history\r\n');
+        expect(manager.getRobotTerminalBuffer(second.sessionId)).toBe('B history\r\n');
+
+        manager.appendRobotTerminalBuffer(first.sessionId, 'A live\r\n');
+        expect(firstOutput).toEqual(['A live\r\n']);
+        expect(secondOutput).toEqual([]);
+
+        manager.appendRobotTerminalBuffer(second.sessionId, 'B live\r\n');
+        expect(firstOutput).toEqual(['A live\r\n']);
+        expect(secondOutput).toEqual(['B live\r\n']);
+
+        unsubscribeFirst();
+        manager.appendRobotTerminalBuffer(first.sessionId, 'A after close\r\n');
+        expect(firstOutput).toEqual(['A live\r\n']);
+
+        unsubscribeSecond();
+    });
+
+    it('writes terminal input to the requested XRP instead of the active IDE robot', async () => {
+        const firstConnection = {
+            isConnected: () => true,
+            isBusy: () => false,
+            writeToDevice: vi.fn(),
+        };
+        const secondConnection = {
+            isConnected: () => true,
+            isBusy: () => false,
+            writeToDevice: vi.fn(),
+        };
+        const first = {
+            sessionId: 'usb-a',
+            alias: 'XRP A',
+            connection: firstConnection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            commands: {},
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const second = {
+            ...first,
+            sessionId: 'usb-b',
+            alias: 'XRP B',
+            connection: secondConnection,
+        };
+
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map([
+                [first.sessionId, first],
+                [second.sessionId, second],
+            ]),
+            bleSessions: new Map(),
+            activeUSBSessionId: second.sessionId,
+            activeBLESessionId: null,
+            activeConnection: secondConnection,
+        });
+
+        manager.writeRobotTerminalData(first.sessionId, 'print("A")\r');
+
+        expect(firstConnection.writeToDevice).toHaveBeenCalledWith('print("A")\r');
+        expect(secondConnection.writeToDevice).not.toHaveBeenCalled();
+
+        firstConnection.isBusy = () => true;
+        manager.writeRobotTerminalData(first.sessionId, 'ignored');
+        expect(firstConnection.writeToDevice).toHaveBeenCalledTimes(1);
     });
 
     it('keeps a pending receiver on its original robot while a sender starts in the newly active IDE', async () => {

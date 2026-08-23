@@ -12,12 +12,14 @@ import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import type { BLERobotFleetSnapshot } from "@/connections/bluetoothFleetTypes";
 import type { IDERobotRuntimeState, MultiRobotEditorRequest, PreferredRobotProgramRequest } from "@/connections/ideRobotTypes";
 import { useGridStackWidget } from "../hooks/useGridStackWidget";
+import { useGridStackContext } from "../lib";
 import SensorCard from "./SensorCard";
 
 const fleet = getRobotFleetManager();
 const appMgr = AppMgr.getInstance();
 const INITIAL_STATUS = "Ready. Add each cable-connected XRP, then choose which robot owns the IDE files.";
 const PREFERRED_PROGRAMS_STORAGE_KEY = "xrp-multiagent-preferred-programs-v1";
+const PREFERRED_FOLDERS_STORAGE_KEY = "xrp-multiagent-preferred-folders-v1";
 
 function readPreferredPrograms(): Record<string, string> {
   if (typeof localStorage === "undefined") return {};
@@ -32,6 +34,49 @@ function readPreferredPrograms(): Record<string, string> {
 function writePreferredPrograms(programs: Record<string, string>): void {
   if (typeof localStorage === "undefined") return;
   localStorage.setItem(PREFERRED_PROGRAMS_STORAGE_KEY, JSON.stringify(programs));
+}
+
+function readPreferredFolders(): Record<string, string> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PREFERRED_FOLDERS_STORAGE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed as Record<string, string> : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePreferredFolders(folders: Record<string, string>): void {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(PREFERRED_FOLDERS_STORAGE_KEY, JSON.stringify(folders));
+}
+
+function getProgramFolder(path: string): string {
+  const normalized = path.startsWith("/") ? path : `/${path}`;
+  const separator = normalized.lastIndexOf("/");
+  return separator <= 0 ? "/" : normalized.slice(0, separator);
+}
+
+function getProgramName(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+function getProgramFolders(programFiles: string[]): string[] {
+  const folders = new Set<string>(["/"]);
+  for (const path of programFiles) {
+    let folder = getProgramFolder(path);
+    while (true) {
+      folders.add(folder);
+      if (folder === "/") break;
+      const separator = folder.lastIndexOf("/");
+      folder = separator <= 0 ? "/" : folder.slice(0, separator);
+    }
+  }
+  return [...folders].sort((first, second) => {
+    if (first === "/") return -1;
+    if (second === "/") return 1;
+    return first.localeCompare(second);
+  });
 }
 
 function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
@@ -54,6 +99,7 @@ function RuntimeDot({ state }: { state: IDERobotRuntimeState }) {
 
 export default function MultiAgentLabWidget() {
   const { handleDelete } = useGridStackWidget();
+  const { addWidget, _rawWidgetMetaMap } = useGridStackContext();
   const [snapshot, setSnapshot] = useState<FleetSnapshot>(() => fleet.snapshot());
   const [usbSnapshot, setUsbSnapshot] = useState<USBRobotFleetSnapshot>(() => appMgr.getUSBFleetSnapshot());
   const [bleIDESnapshot, setBleIDESnapshot] = useState<BLERobotFleetSnapshot>(() => appMgr.getBluetoothIDEFleetSnapshot());
@@ -63,6 +109,7 @@ export default function MultiAgentLabWidget() {
   const [showMultiEditorChoices, setShowMultiEditorChoices] = useState(false);
   const [preparingBluetoothSessionId, setPreparingBluetoothSessionId] = useState<string | null>(null);
   const [preferredPrograms, setPreferredPrograms] = useState<Record<string, string>>(() => readPreferredPrograms());
+  const [preferredFolders, setPreferredFolders] = useState<Record<string, string>>(() => readPreferredFolders());
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
   const connectedIDERobots = [
@@ -168,6 +215,40 @@ export default function MultiAgentLabWidget() {
     }
   };
 
+  const openRobotTerminal = (sessionId: string, alias: string) => {
+    const alreadyOpen = [..._rawWidgetMetaMap.value.values()].some((meta) => {
+      if (!meta.content) return false;
+      try {
+        const parsed = JSON.parse(meta.content) as {
+          name?: string;
+          props?: { sessionId?: string };
+        };
+        return parsed.name === "XRPTerminalWidget" && parsed.props?.sessionId === sessionId;
+      } catch {
+        return false;
+      }
+    });
+
+    if (alreadyOpen) {
+      setStatus(`${alias} terminal is already open.`);
+      return;
+    }
+
+    addWidget(() => ({
+      h: 7,
+      w: 4,
+      x: 8,
+      y: 2,
+      minW: 3,
+      minH: 5,
+      content: JSON.stringify({
+        name: "XRPTerminalWidget",
+        props: { sessionId, alias },
+      }),
+    }));
+    setStatus(`Opened terminal for ${alias}.`);
+  };
+
   const prepareUSBForBluetooth = async (sessionId: string, alias: string) => {
     setPreparingBluetoothSessionId(sessionId);
     setStatus(`Preparing ${alias} for faster Bluetooth team runs...`);
@@ -251,6 +332,45 @@ export default function MultiAgentLabWidget() {
     });
   };
 
+  const updatePreferredFolder = (sessionId: string, folder: string) => {
+    setPreferredFolders((current) => {
+      const next = { ...current, [sessionId]: folder };
+      writePreferredFolders(next);
+      return next;
+    });
+    setPreferredPrograms((current) => {
+      const selected = current[sessionId];
+      if (!selected || getProgramFolder(selected) === folder) return current;
+      const next = { ...current };
+      delete next[sessionId];
+      writePreferredPrograms(next);
+      return next;
+    });
+  };
+
+  const runPreferredProgram = async (
+    sessionId: string,
+    alias: string,
+    programFiles: string[],
+  ) => {
+    const selected = preferredPrograms[sessionId];
+
+    if (!selected || !programFiles.includes(selected)) {
+      setStatus(`Choose a preferred Python or Blockly file for ${alias}.`);
+      return;
+    }
+
+    const request: PreferredRobotProgramRequest = {
+      sessionId,
+      path: selected,
+    };
+
+    await run(
+      () => appMgr.runPreferredProgramsOnRobots([request]),
+      `Started preferred program on ${alias}.`,
+    );
+  };
+
   const runPreferredPrograms = async () => {
     const missing = connectedIDERobots.filter((robot) => {
       const selected = preferredPrograms[robot.sessionId];
@@ -261,7 +381,7 @@ export default function MultiAgentLabWidget() {
       return;
     }
     if (missing.length > 0) {
-      setStatus(`Choose a preferred Python file for ${missing.map((robot) => robot.alias).join(", ")}.`);
+      setStatus(`Choose a preferred Python or Blockly file for ${missing.map((robot) => robot.alias).join(", ")}.`);
       return;
     }
     const requests: PreferredRobotProgramRequest[] = connectedIDERobots.map((robot) => ({
@@ -337,25 +457,63 @@ export default function MultiAgentLabWidget() {
           <div className="grid gap-2 md:grid-cols-2">
             {connectedIDERobots.map((robot) => {
               const selected = preferredPrograms[robot.sessionId];
-              const value = selected && robot.programFiles.includes(selected) ? selected : "";
+              const selectedProgram = selected && robot.programFiles.includes(selected) ? selected : "";
+              const folders = getProgramFolders(robot.programFiles);
+              const storedFolder = preferredFolders[robot.sessionId];
+              const inferredFolder = selectedProgram ? getProgramFolder(selectedProgram) : "/";
+              const folder = storedFolder && folders.includes(storedFolder) ? storedFolder : inferredFolder;
+              const filesInFolder = robot.programFiles.filter((path) => getProgramFolder(path) === folder);
+              const value = selectedProgram && filesInFolder.includes(selectedProgram) ? selectedProgram : "";
               return (
-                <label key={robot.sessionId} className="grid gap-1 text-xs text-gray-200">
+                <div key={robot.sessionId} className="grid gap-2 rounded-lg border border-purple-400/30 bg-purple-950/10 p-2 text-xs text-gray-200">
                   <span className="flex items-center gap-2">
                     <RuntimeDot state={robot.runtimeState} />
                     <strong>{robot.alias}</strong>
                   </span>
-                  <select
-                    className="w-full rounded border border-purple-300 bg-black p-2 text-white disabled:opacity-50"
-                    value={value}
-                    disabled={robot.programFiles.length === 0 || robot.runtimeState !== "idle"}
-                    onChange={(event) => updatePreferredProgram(robot.sessionId, event.target.value)}
-                  >
-                    <option value="">{robot.programFiles.length === 0 ? "No Python files found" : "Select Python file"}</option>
-                    {robot.programFiles.map((path) => (
-                      <option key={path} value={path}>{path}</option>
-                    ))}
-                  </select>
-                </label>
+                  <label className="grid gap-1">
+                    <span className="text-[11px] text-gray-400">Folder</span>
+                    <select
+                      className="w-full rounded border border-purple-300 bg-black p-2 text-white disabled:opacity-50"
+                      value={folder}
+                      disabled={robot.programFiles.length === 0 || robot.runtimeState !== "idle"}
+                      onChange={(event) => updatePreferredFolder(robot.sessionId, event.target.value)}
+                    >
+                      {folders.map((path) => (
+                        <option key={path} value={path}>{path}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-1">
+                    <span className="text-[11px] text-gray-400">Program</span>
+                    <div className="flex gap-2">
+                      <select
+                        className="min-w-0 flex-1 rounded border border-purple-300 bg-black p-2 text-white disabled:opacity-50"
+                        value={value}
+                        disabled={filesInFolder.length === 0 || robot.runtimeState !== "idle"}
+                        onChange={(event) => updatePreferredProgram(robot.sessionId, event.target.value)}
+                      >
+                        <option value="">
+                          {robot.programFiles.length === 0
+                            ? "No Python or Blockly files found"
+                            : filesInFolder.length === 0
+                              ? "No programs in this folder"
+                              : "Select program"}
+                        </option>
+                        {filesInFolder.map((path) => (
+                          <option key={path} value={path}>{getProgramName(path)}</option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        className="shrink-0 rounded-lg border border-green-300 bg-black px-3 py-2 font-bold text-green-100 transition hover:bg-green-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled={!value || robot.runtimeState !== "idle"}
+                        onClick={() => void runPreferredProgram(robot.sessionId, robot.alias, robot.programFiles)}
+                      >
+                        Run
+                      </button>
+                    </div>
+                  </label>
+                </div>
               );
             })}
             {connectedIDERobots.length === 0 && (
@@ -388,6 +546,7 @@ export default function MultiAgentLabWidget() {
               {session.error && <p className="mt-2 text-xs text-red-300">{session.error}</p>}
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
                 {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectUSBRobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
+                {session.state === "connected" && <button className="rounded-lg border border-emerald-300 px-2 py-1 text-emerald-100 transition hover:bg-emerald-500 hover:text-black" onClick={() => openRobotTerminal(session.sessionId, session.alias)}>Open terminal</button>}
                 {session.state === "connected" && <button className="rounded-lg border border-cyan-300 px-2 py-1 text-cyan-100 transition hover:bg-cyan-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50" disabled={session.runtimeState !== "idle" || preparingBluetoothSessionId !== null} onClick={() => void prepareUSBForBluetooth(session.sessionId, session.alias)}>{preparingBluetoothSessionId === session.sessionId ? "Preparing..." : "Prepare for Bluetooth"}</button>}
                 {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectUSBRobot(session.sessionId), `${session.alias} reconnected.`)}>Reconnect</button>}
                 {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectUSBRobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}

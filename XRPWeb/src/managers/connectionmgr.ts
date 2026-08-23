@@ -32,6 +32,8 @@ import {
 
 type TeamTransportMode = 'usb' | 'bluetooth' | 'bluetooth_uart';
 
+type RobotTerminalListener = (data: string) => void;
+
 interface USBRobotSessionRecord {
     sessionId: string;
     alias: string;
@@ -100,6 +102,7 @@ export default class ConnectionMgr {
     private activeBLESessionId: string | null = null;
     private bleSessionSequence = 0;
     private switchingBLESession = false;
+    private terminalListeners = new Map<string, Set<RobotTerminalListener>>();
     private xrpID: string | undefined = undefined;
 
     constructor(appMgr: AppMgr) {
@@ -425,6 +428,37 @@ export default class ConnectionMgr {
         const record = this.getRobotRecord(sessionId);
         if (!record || !data) return;
         this.appendTerminalBuffer(record, data);
+    }
+
+    public getRobotTerminalBuffer(sessionId: string): string {
+        return this.getRobotRecord(sessionId)?.terminalBuffer ?? '';
+    }
+
+    public subscribeRobotTerminal(sessionId: string, listener: RobotTerminalListener): () => void {
+        if (!this.getRobotRecord(sessionId)) {
+            throw new Error(`Unknown XRP session: ${sessionId}`);
+        }
+        if (!this.terminalListeners) this.terminalListeners = new Map<string, Set<RobotTerminalListener>>();
+        let listeners = this.terminalListeners.get(sessionId);
+        if (!listeners) {
+            listeners = new Set<RobotTerminalListener>();
+            this.terminalListeners.set(sessionId, listeners);
+        }
+        listeners.add(listener);
+        return () => {
+            const current = this.terminalListeners.get(sessionId);
+            current?.delete(listener);
+            if (current?.size === 0) this.terminalListeners.delete(sessionId);
+        };
+    }
+
+    public writeRobotTerminalData(sessionId: string, data: string): void {
+        if (!data) return;
+        const record = this.getRobotRecord(sessionId);
+        if (!record) throw new Error(`Unknown XRP session: ${sessionId}`);
+        if (!record.connection.isConnected()) return;
+        if (record.connection.isBusy()) return;
+        record.connection.writeToDevice(data);
     }
 
     public markActiveRobotRuntimeState(runtimeState: IDERobotRuntimeState): void {
@@ -1140,6 +1174,15 @@ export default class ConnectionMgr {
     private appendTerminalBuffer(record: IDERobotSessionRecord, data: string): void {
         const maximumLength = 12000;
         record.terminalBuffer = (record.terminalBuffer + data).slice(-maximumLength);
+        const listeners = this.terminalListeners?.get(record.sessionId);
+        if (!listeners) return;
+        for (const listener of listeners) {
+            try {
+                listener(data);
+            } catch (error) {
+                console.warn(`Terminal listener failed for ${record.alias}:`, error);
+            }
+        }
     }
 
     private async refreshFilesystemForRecord(record: IDERobotSessionRecord): Promise<void> {
@@ -1166,7 +1209,7 @@ export default class ConnectionMgr {
             const visit = (node: RobotFilesystemNode) => {
                 if (node.children === null) {
                     const filePath = node.path === '/' ? `/${node.name}` : `${node.path}/${node.name}`;
-                    if (filePath.endsWith('.py') && filePath !== '/main.py') files.push(filePath);
+                    if ((filePath.endsWith('.py') || filePath.endsWith('.blocks')) && filePath !== '/main.py') files.push(filePath);
                     return;
                 }
                 for (const child of node.children ?? []) visit(child);
@@ -1206,7 +1249,9 @@ export default class ConnectionMgr {
         if (normalized.includes('\r') || normalized.includes('\n') || normalized.includes("'")) {
             throw new Error('Preferred program path contains unsupported characters.');
         }
-        if (!normalized.endsWith('.py')) throw new Error('Preferred programs must be Python files.');
+        if (!normalized.endsWith('.py') && !normalized.endsWith('.blocks')) {
+            throw new Error('Preferred programs must be Python or Blockly files.');
+        }
         return normalized.startsWith('/') ? normalized : `/${normalized}`;
     }
 
