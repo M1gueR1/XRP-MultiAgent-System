@@ -1,5 +1,6 @@
 import unittest
 
+import MultiAgentLib.team as team_module
 from MultiAgentLib.codec import decode_message, decode_xpp, encode_message, encode_packet
 from MultiAgentLib.constants import (
     FLAG_ACK_REQUIRED,
@@ -149,6 +150,38 @@ class MultiAgentCodecTests(unittest.TestCase):
         message = self.example(payload)
         team._on_directory_message(message)
         self.assertEqual(team.resolve_target("blue xrp"), 2)
+
+    def test_send_to_unknown_alias_is_a_noop(self):
+        writes = []
+        transport = MultiAgentTransport(writer=lambda data: writes.append(bytes(data)))
+        node = MultiAgentNode("missing-alias-test", transport=transport)
+        node.started = True
+        node.ready = True
+        node.robot_id = 1
+        node._last_hello_ms = ticks_ms()
+        node._last_heartbeat_ms = ticks_ms()
+        team = TeamLink(node=node)
+        team._started = True
+        original_timeout = team_module.TARGET_RESOLUTION_TIMEOUT_MS
+        team_module.TARGET_RESOLUTION_TIMEOUT_MS = 0
+        try:
+            self.assertIsNone(team.send("distance", 12, target="Blue XRP"))
+        finally:
+            team_module.TARGET_RESOLUTION_TIMEOUT_MS = original_timeout
+        self.assertEqual(writes, [])
+
+    def test_send_to_invalid_numeric_target_still_raises(self):
+        transport = MultiAgentTransport(writer=lambda _data: None)
+        node = MultiAgentNode("invalid-target-test", transport=transport)
+        node.started = True
+        node.ready = True
+        node.robot_id = 1
+        node._last_hello_ms = ticks_ms()
+        node._last_heartbeat_ms = ticks_ms()
+        team = TeamLink(node=node)
+        team._started = True
+        with self.assertRaises(ValueError):
+            team.send("distance", 12, target="99999")
 
 
 if __name__ == "__main__":

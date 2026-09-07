@@ -73,6 +73,7 @@ import { fireGoogleUserTree, getUsernameFromEmail } from '@/utils/google-utils';
 import XRPDriverInstallDlg from '@components/dialogs/driver-installs';
 import powerswitch_standard from '@assets/images/XRP-nonbeta-controller-power.jpg';
 import powerswitch_beta from '@assets/images/XRP_Controller-Power.jpg';
+import xrpRunSelector from '@assets/images/xrp-run-selector.png';
 import BusyDialog from '@components/dialogs/busydlg';
 import { UAParser } from 'ua-parser-js';
 import backup_restore from '@assets/images/backup_restore.svg';
@@ -80,13 +81,19 @@ import BackupRestoreDlg from '@components/dialogs/backup-restoredlg';
 import BackupDlg from '@components/dialogs/backupdlg';
 import RestoreDlg from '@components/dialogs/restoredlg';
 import MultiRobotSaveDialog from '@/components/dialogs/multi-robot-save-dialog';
-import type { MultiRobotEditorRequest, MultiRobotSaveRequest } from '@/connections/ideRobotTypes';
+import type {
+    IDERobotTargetSnapshot,
+    MultiRobotEditorRequest,
+    MultiRobotSaveRequest,
+} from '@/connections/ideRobotTypes';
 import { blocklyToPython } from '@components/blockly/blocklyCodegen';
 
 type NavBarProps = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     layoutref: any;
 };
+
+type RunTarget = 'default' | 'this' | 'all';
 
 let hasSubscribed = false;
 
@@ -138,6 +145,15 @@ function NavBar({ layoutref }: NavBarProps) {
     const stoppingRef = useRef(false);
     const browserCheckRef = useRef(false);
     const multiRunSessionIdsRef = useRef<string[]>([]);
+    const runChoiceRef = useRef<HTMLDivElement>(null);
+    const [isRunChoiceOpen, setRunChoiceOpen] = useState(false);
+    const [runChoicePosition, setRunChoicePosition] = useState({ top: 0, right: 0 });
+    const [isSomeRobotRunDialogOpen, setSomeRobotRunDialogOpen] = useState(false);
+    const [someRobotRunTargets, setSomeRobotRunTargets] = useState<IDERobotTargetSnapshot[]>([]);
+    const [selectedSomeRobotSessionIds, setSelectedSomeRobotSessionIds] = useState<string[]>([]);
+    const [, setMultiRobotRunChoiceEnabled] = useState(
+        () => AppMgr.getInstance().isMultiRobotRunChoiceEnabled(),
+    );
     const activeEditorSession = EditorMgr.getInstance().getEditorSession(activeTab);
     const isMultiRobotMode = Boolean(activeEditorSession?.multiRobotSessionIds?.length);
     const syncActiveRunningState = () => {
@@ -366,6 +382,19 @@ function NavBar({ layoutref }: NavBarProps) {
         }
     });
 
+    useEffect(() => {
+        const handleRunChoiceMode = (state: string) => {
+            setMultiRobotRunChoiceEnabled(state === 'on');
+            setRunChoiceOpen(false);
+        };
+
+        setMultiRobotRunChoiceEnabled(AppMgr.getInstance().isMultiRobotRunChoiceEnabled());
+        AppMgr.getInstance().on(EventType.EVENT_MULTI_ROBOT_RUN_CHOICE, handleRunChoiceMode);
+        return () => {
+            AppMgr.getInstance().eventOff(EventType.EVENT_MULTI_ROBOT_RUN_CHOICE, handleRunChoiceMode);
+        };
+    }, []);
+
     /**
      * toggleMoreDropdown - toggle the more dropdown menu when the mouse click outside the menu
      */
@@ -385,6 +414,20 @@ function NavBar({ layoutref }: NavBarProps) {
             document.removeEventListener('mousedown', handleClickOutside);
         };
     }, [dropdownRef]);
+
+    useEffect(() => {
+        if (!isRunChoiceOpen) return;
+        function handleRunChoiceOutside(event: MouseEvent) {
+            if (runChoiceRef.current && !runChoiceRef.current.contains(event.target as Node)) {
+                setRunChoiceOpen(false);
+            }
+        }
+
+        document.addEventListener('mousedown', handleRunChoiceOutside);
+        return () => {
+            document.removeEventListener('mousedown', handleRunChoiceOutside);
+        };
+    }, [isRunChoiceOpen]);
 
     if (loading) {
         return <div>Loading...</div>;
@@ -1073,6 +1116,118 @@ function NavBar({ layoutref }: NavBarProps) {
      */
     async function onRunBtnClicked() {
         console.log('onRunBtnClicked');
+        const shouldShowRunChoice = AppMgr.getInstance().isMultiRobotRunChoiceEnabled();
+        if (!isRunning && shouldShowRunChoice) {
+            const rect = runChoiceRef.current?.getBoundingClientRect();
+            if (rect) {
+                setRunChoicePosition({
+                    top: rect.bottom + 8,
+                    right: Math.max(8, window.innerWidth - rect.right),
+                });
+            }
+            setMultiRobotRunChoiceEnabled(true);
+            setRunChoiceOpen((open) => !open);
+            return;
+        }
+
+        setMultiRobotRunChoiceEnabled(shouldShowRunChoice);
+        await runFromRunButton('default');
+    }
+
+    function openSomeRobotRunDialog() {
+        const connectedRobots = AppMgr.getInstance().getConnectedIDERobots();
+        if (connectedRobots.length < 1) {
+            setDialogContent(
+                <AlertDialog
+                    alertMessage="Connect at least one XRP in Multi-Agent Lab before choosing selected XRPs."
+                    toggleDialog={toggleDialog}
+                />,
+            );
+            toggleDialog();
+            return;
+        }
+
+        setSomeRobotRunTargets(connectedRobots);
+        setSelectedSomeRobotSessionIds(connectedRobots.map((robot) => robot.sessionId));
+        setRunChoiceOpen(false);
+        setSomeRobotRunDialogOpen(true);
+    }
+
+    function closeSomeRobotRunDialog() {
+        setSomeRobotRunDialogOpen(false);
+    }
+
+    function toggleSomeRobotRunTarget(sessionId: string) {
+        setSelectedSomeRobotSessionIds((current) => {
+            if (current.includes(sessionId)) {
+                return current.filter((id) => id !== sessionId);
+            }
+            return [...current, sessionId];
+        });
+    }
+
+    async function runProgramOnSelectedRobotSessions(
+        sessionIds: string[],
+        selectedSession: EditorSession,
+    ) {
+        const uniqueSessionIds = Array.from(new Set(sessionIds));
+        if (uniqueSessionIds.length < 1) {
+            setDialogContent(
+                <AlertDialog
+                    alertMessage="Select at least one XRP before running this program."
+                    toggleDialog={toggleDialog}
+                />,
+            );
+            toggleDialog();
+            return;
+        }
+
+        setRunning(true);
+        multiRunSessionIdsRef.current = uniqueSessionIds;
+        try {
+            await AppMgr.getInstance().runProgramOnRobots(
+                uniqueSessionIds,
+                selectedSession.path,
+                selectedSession.content ?? '',
+            );
+            selectedSession.isModified = false;
+            EditorMgr.getInstance().SaveToLocalStorage(
+                selectedSession,
+                selectedSession.content ?? '',
+            );
+        } catch (error) {
+            setDialogContent(
+                <AlertDialog
+                    alertMessage={error instanceof Error ? error.message : String(error)}
+                    toggleDialog={toggleDialog}
+                />,
+            );
+            if (!dialogRef.current?.open) dialogRef.current?.showModal();
+        } finally {
+            multiRunSessionIdsRef.current = [];
+            syncActiveRunningState();
+            setIsStopping(false);
+        }
+    }
+
+    async function runInSomeSelectedRobots() {
+        const selectedSession = EditorMgr.getInstance().getEditorSession(activeTab);
+        syncBlocklySessionContent(selectedSession);
+        if (!selectedSession) {
+            setSomeRobotRunDialogOpen(false);
+            setDialogContent(
+                <AlertDialog alertMessage={t('no-editor-run')} toggleDialog={toggleDialog} />,
+            );
+            toggleDialog();
+            return;
+        }
+
+        setSomeRobotRunDialogOpen(false);
+        await runProgramOnSelectedRobotSessions(selectedSomeRobotSessionIds, selectedSession);
+    }
+
+    async function runFromRunButton(runTarget: RunTarget) {
+        setRunChoiceOpen(false);
 
         const resetRunButtonStates = () => {
             AppMgr.getInstance().on(EventType.EVENT_PROGRAM_EXECUTED, () => {
@@ -1110,7 +1265,13 @@ function NavBar({ layoutref }: NavBarProps) {
 
             const selectedSession = EditorMgr.getInstance().getEditorSession(activeTab);
             syncBlocklySessionContent(selectedSession);
-            if (selectedSession && !EditorMgr.getInstance().targetsActiveRobot(selectedSession)) {
+            const runAllConnected = runTarget === 'all';
+            const forceThisRobot = runTarget === 'this';
+            if (
+                selectedSession &&
+                runTarget === 'default' &&
+                !EditorMgr.getInstance().targetsActiveRobot(selectedSession)
+            ) {
                 setDialogContent(
                     <AlertDialog
                         alertMessage="This tab belongs to another XRP. Select that robot in Multi-Agent Lab before running it."
@@ -1121,7 +1282,25 @@ function NavBar({ layoutref }: NavBarProps) {
                 return;
             }
 
-            if (selectedSession?.multiRobotSessionIds?.length) {
+            if (runAllConnected && selectedSession) {
+                const connectedRobots = AppMgr.getInstance().getConnectedIDERobots();
+                const sessionIds = connectedRobots.map((robot) => robot.sessionId);
+                if (sessionIds.length < 2) {
+                    setDialogContent(
+                        <AlertDialog
+                            alertMessage="Connect at least two XRPs in Multi-Agent Lab before running in all XRPs."
+                            toggleDialog={toggleDialog}
+                        />,
+                    );
+                    toggleDialog();
+                    return;
+                }
+
+                await runProgramOnSelectedRobotSessions(sessionIds, selectedSession);
+                return;
+            }
+
+            if (selectedSession?.multiRobotSessionIds?.length && !forceThisRobot) {
                 const sessionIds = selectedSession.multiRobotSessionIds;
                 setRunning(true);
                 multiRunSessionIdsRef.current = sessionIds;
@@ -1703,24 +1882,57 @@ function NavBar({ layoutref }: NavBarProps) {
                     </svg>
                     <span>{t('connectXRP')}</span>
                 </button>
-                <button
-                    id="runBtn"
-                    className={`text-white h-full w-[120] items-center justify-center rounded-3xl px-4 py-2 ${isMultiRobotMode ? (isRunning ? 'bg-purple-900' : 'bg-purple-700') : isRunning ? 'bg-cinnabar-600' : 'bg-chateau-green-500'} ${isConnected ? 'flex' : 'hidden'}`}
-                    onClick={onRunBtnClicked}
-                    disabled={isStopping}
-                >
-                    {isRunning ? (
-                        <>
-                            <span>{t('stop')}</span>
-                            <IoStop />
-                        </>
-                    ) : (
-                        <>
-                            <span>{isMultiRobotMode ? 'Run all' : t('run')}</span>
-                            <IoPlaySharp />
-                        </>
+                <div ref={runChoiceRef} className={`relative ${isConnected ? 'block' : 'hidden'}`}>
+                    {isRunChoiceOpen && !isRunning && (
+                        <div
+                            className="fixed z-[1000] w-48 rounded-xl border border-white/70 bg-black p-2 text-xs text-white shadow-[0_0_24px_rgba(0,0,0,0.45)]"
+                            style={{ top: runChoicePosition.top, right: runChoicePosition.right }}
+                        >
+                            <button
+                                type="button"
+                                className="mb-2 flex w-full items-center justify-center gap-2 rounded-lg border border-green-300 bg-green-600 px-3 py-2 font-bold text-white transition hover:bg-green-500"
+                                onClick={() => void runFromRunButton('this')}
+                            >
+                                <IoPlaySharp />
+                                <span>Run in this XRP</span>
+                            </button>
+                            <button
+                                type="button"
+                                className="flex w-full items-center justify-center gap-2 rounded-lg border border-purple-300 bg-purple-700 px-3 py-2 font-bold text-white transition hover:bg-purple-600"
+                                onClick={() => void runFromRunButton('all')}
+                            >
+                                <IoPlaySharp />
+                                <span>Run in all XRPs</span>
+                            </button>
+                            <button
+                                type="button"
+                                className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-fuchsia-300 bg-fuchsia-800 px-3 py-2 font-bold text-white transition hover:bg-fuchsia-700"
+                                onClick={openSomeRobotRunDialog}
+                            >
+                                <IoPlaySharp />
+                                <span>Run in some XRPs</span>
+                            </button>
+                        </div>
                     )}
-                </button>
+                    <button
+                        id="runBtn"
+                        className={`text-white h-full w-[120] items-center justify-center rounded-3xl px-4 py-2 ${isMultiRobotMode ? (isRunning ? 'bg-purple-900' : 'bg-purple-700') : isRunning ? 'bg-cinnabar-600' : 'bg-chateau-green-500'} flex`}
+                        onClick={onRunBtnClicked}
+                        disabled={isStopping}
+                    >
+                        {isRunning ? (
+                            <>
+                                <span>{t('stop')}</span>
+                                <IoStop />
+                            </>
+                        ) : (
+                            <>
+                                <span>{isMultiRobotMode ? 'Run all' : t('run')}</span>
+                                <IoPlaySharp />
+                            </>
+                        )}
+                    </button>
+                </div>
                 <div ref={dropdownRef} className="group relative transition-all">
                     <button
                         id="settingsId"
@@ -1754,6 +1966,96 @@ function NavBar({ layoutref }: NavBarProps) {
                     )}
                 </div>
             </div>
+            {isSomeRobotRunDialogOpen && (
+                <div
+                    className="fixed inset-0 z-[1000] flex items-center justify-center bg-mountain-mist-950 px-4"
+                    onMouseDown={(event) => {
+                        if (event.target === event.currentTarget) {
+                            closeSomeRobotRunDialog();
+                        }
+                    }}
+                >
+                    <div className="flex w-[min(92vw,760px)] flex-col gap-4 rounded-xl border border-purple-300 bg-black p-5 text-white shadow-[0_0_32px_rgba(126,34,206,0.28)]">
+                        <header className="flex items-center justify-between border-b border-purple-300/50 pb-3">
+                            <div>
+                                <h2 className="text-lg font-bold text-purple-100">Run in some XRPs</h2>
+                                <p className="mt-1 text-xs text-mountain-mist-300">
+                                    Choose which connected robots should run the current program.
+                                </p>
+                            </div>
+                            <button
+                                type="button"
+                                className="rounded-lg border border-white/40 px-3 py-1 text-sm font-bold text-white transition hover:border-white hover:bg-white/10"
+                                onClick={closeSomeRobotRunDialog}
+                            >
+                                X
+                            </button>
+                        </header>
+
+                        <div className="flex gap-3 overflow-x-auto pb-2">
+                            {someRobotRunTargets.map((robot) => {
+                                const isSelected = selectedSomeRobotSessionIds.includes(robot.sessionId);
+                                return (
+                                    <div
+                                        key={robot.sessionId}
+                                        className={`flex min-w-40 flex-col items-center gap-3 rounded-xl border p-3 transition ${
+                                            isSelected
+                                                ? 'border-green-300 bg-green-950/40'
+                                                : 'border-mountain-mist-600 bg-shark-950'
+                                        }`}
+                                    >
+                                        <div className="w-full text-center text-sm font-bold text-white">
+                                            Name: {robot.alias}
+                                        </div>
+                                        <div className="flex h-28 w-32 items-center justify-center rounded-lg bg-white/95 p-2">
+                                            <img
+                                                src={xrpRunSelector}
+                                                alt={`${robot.alias} XRP`}
+                                                className="max-h-full max-w-full object-contain"
+                                            />
+                                        </div>
+                                        <button
+                                            type="button"
+                                            aria-pressed={isSelected}
+                                            className={`w-full rounded-lg border px-3 py-2 text-sm font-bold transition ${
+                                                isSelected
+                                                    ? 'border-green-300 bg-green-600 text-white hover:bg-green-500'
+                                                    : 'border-mountain-mist-500 bg-black text-mountain-mist-300 hover:border-white hover:text-white'
+                                            }`}
+                                            onClick={() => toggleSomeRobotRunTarget(robot.sessionId)}
+                                        >
+                                            {isSelected ? 'Active' : 'Inactive'}
+                                        </button>
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        <footer className="flex items-center justify-between border-t border-purple-300/50 pt-3">
+                            <span className="text-xs text-mountain-mist-300">
+                                {selectedSomeRobotSessionIds.length} selected
+                            </span>
+                            <div className="flex gap-2">
+                                <button
+                                    type="button"
+                                    className="rounded-lg border border-mountain-mist-500 px-4 py-2 text-sm font-bold text-white transition hover:border-white hover:bg-white/10"
+                                    onClick={closeSomeRobotRunDialog}
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    className="rounded-lg border border-purple-300 bg-purple-700 px-4 py-2 text-sm font-bold text-white transition hover:bg-purple-600 disabled:cursor-not-allowed disabled:opacity-50"
+                                    disabled={selectedSomeRobotSessionIds.length < 1 || isRunning}
+                                    onClick={() => void runInSomeSelectedRobots()}
+                                >
+                                    Run in selected XRPs
+                                </button>
+                            </div>
+                        </footer>
+                    </div>
+                </div>
+            )}
             <Dialog isOpen={isDlgOpen} toggleDialog={toggleDialog} ref={dialogRef}>
                 {dialogContent}
             </Dialog>

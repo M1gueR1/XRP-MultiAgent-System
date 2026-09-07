@@ -128,6 +128,21 @@ describe('XRP team communication Blockly blocks', () => {
     expect(generated).toContain('(120, -40)');
   });
 
+  it('generates a current-XRP-name conditional block', () => {
+    const branch = workspace.newBlock('xrp_team_if_my_name');
+    branch.setFieldValue('xrp_usb_a', 'ROBOT_NAME');
+    const update = workspace.newBlock('xrp_team_update');
+    const input = branch.getInput('DO')?.connection;
+    if (!input || !update.previousConnection) throw new Error('Missing statement connection.');
+    input.connect(update.previousConnection);
+
+    const generated = pythonGenerator.workspaceToCode(workspace);
+
+    expect(generated).toContain('current_XRP_name = ""');
+    expect(generated).toContain('if current_XRP_name == "xrp_usb_a":');
+    expect(generated).toContain('  xrpTeam.update()');
+  });
+
   it('hides position helper blocks from the team toolbox category', () => {
     const toolboxText = JSON.stringify(BlocklyConfigs.ToolboxJson);
 
@@ -137,5 +152,6 @@ describe('XRP team communication Blockly blocks', () => {
     expect(toolboxText).toContain('xrp_team_start');
     expect(toolboxText).toContain('xrp_team_send_to_name');
     expect(toolboxText).toContain('xrp_team_send_to_id');
+    expect(toolboxText).toContain('xrp_team_if_my_name');
   });
 });

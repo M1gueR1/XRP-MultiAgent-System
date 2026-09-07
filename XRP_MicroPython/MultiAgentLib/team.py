@@ -61,6 +61,15 @@ def _normalize_channel(channel):
     return channel, encoded
 
 
+def _is_missing_alias_error(target, error):
+    if isinstance(target, int) or isinstance(target, bool):
+        return False
+    normalized = str(target).strip().lower()
+    if normalized.isdigit():
+        return False
+    return str(error).startswith("unknown robot alias:")
+
+
 def encode_typed_value(channel, value):
     channel, channel_bytes = _normalize_channel(channel)
     if value is None:
@@ -215,7 +224,12 @@ class TeamLink:
             self.node.poll()
         if not self.wait_until_ready():
             raise RuntimeError("team communication handshake timed out")
-        target_id = self.resolve_target(target)
+        try:
+            target_id = self.resolve_target(target)
+        except ValueError as error:
+            if _is_missing_alias_error(target, error):
+                return None
+            raise
         _, payload = encode_typed_value(channel, value)
         if mode == "latest":
             flags = FLAG_LATEST_ONLY

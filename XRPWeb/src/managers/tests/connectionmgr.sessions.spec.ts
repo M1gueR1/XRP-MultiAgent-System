@@ -9,6 +9,11 @@ function deferred() {
     return { promise, resolve };
 }
 
+function getUploadedContent(commands: { uploadFile: unknown }, callIndex = 0): string {
+    const mock = commands.uploadFile as { mock: { calls: unknown[][] } };
+    return String(mock.mock.calls[callIndex]?.[1] ?? '');
+}
+
 describe('ConnectionMgr session-bound runs', () => {
     it('prepares multi-robot targets sequentially and launches only after every target is ready', async () => {
         const order: string[] = [];
@@ -77,6 +82,67 @@ describe('ConnectionMgr session-bound runs', () => {
             'execute-a',
             'execute-b',
         ]);
+    });
+
+    it('injects each robot alias before uploading a shared program', async () => {
+        const makeCommands = () => ({
+            BUSY: false,
+            prepareForRun: vi.fn(async () => undefined),
+            uploadFile: vi.fn(async () => undefined),
+            verifyUploadedFiles: vi.fn(async () => undefined),
+            updateMainFile: vi.fn(async () => 'print("launch")'),
+            executeLines: vi.fn(async () => undefined),
+        });
+        const connection = { isConnected: () => true };
+        const firstCommands = makeCommands();
+        const secondCommands = makeCommands();
+        const first = {
+            sessionId: 'usb-a',
+            alias: 'xrp_usb_a',
+            connection,
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            terminalBuffer: '',
+            commands: firstCommands,
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+        };
+        const second = {
+            ...first,
+            sessionId: 'usb-b',
+            alias: 'xrp_usb_b',
+            commands: secondCommands,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            usbSessions: new Map([
+                [first.sessionId, first],
+                [second.sessionId, second],
+            ]),
+            bleSessions: new Map(),
+            activeUSBSessionId: null,
+            activeBLESessionId: null,
+            activeConnection: null,
+        });
+
+        await manager.runProgramOnRobots(
+            [first.sessionId, second.sessionId],
+            '/shared.py',
+            'print(current_XRP_name)',
+        );
+
+        const firstUpload = getUploadedContent(firstCommands);
+        const secondUpload = getUploadedContent(secondCommands);
+        expect(firstUpload).toContain('current_XRP_name = "xrp_usb_a"');
+        expect(secondUpload).toContain('current_XRP_name = "xrp_usb_b"');
+        expect(firstUpload).toContain('print(current_XRP_name)');
+        expect(secondUpload).toContain('print(current_XRP_name)');
+        expect(firstUpload).not.toContain('current_XRP_name = "xrp_usb_b"');
+        expect(secondUpload).not.toContain('current_XRP_name = "xrp_usb_a"');
     });
 
     it('runs each selected preferred program without uploading shared editor content', async () => {
@@ -612,14 +678,16 @@ describe('ConnectionMgr session-bound runs', () => {
             'print("sender")',
         );
 
+        const uploadedContent = getUploadedContent(commands);
         expect(commands.uploadFile).toHaveBeenCalledWith(
             '/sender.py',
-            'print("sender")',
+            expect.stringContaining('current_XRP_name = "XRP A"'),
             false,
         );
+        expect(uploadedContent).toContain('print("sender")');
         expect(commands.verifyUploadedFiles).toHaveBeenCalledWith([{
             path: '/sender.py',
-            byteLength: new TextEncoder().encode('print("sender")').length,
+            byteLength: new TextEncoder().encode(uploadedContent).length,
         }]);
         expect(commands.executeLines).toHaveBeenCalledOnce();
         expect(bluetooth.runtimeState).toBe('idle');

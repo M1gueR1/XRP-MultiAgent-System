@@ -71,6 +71,7 @@ export enum EventType {
     EVENT_BLE_IDE_FLEET = 'ble-ide-fleet', // multi-Bluetooth full IDE connection updates
     EVENT_CREATE_MULTI_ROBOT_EDITOR = 'create-multi-robot-editor',
     EVENT_MULTI_ROBOT_SAVE_REQUEST = 'multi-robot-save-request',
+    EVENT_MULTI_ROBOT_RUN_CHOICE = 'multi-robot-run-choice',
 }
 
 type Events = {
@@ -112,7 +113,15 @@ type Events = {
     [EventType.EVENT_BLE_IDE_FLEET]: string;
     [EventType.EVENT_CREATE_MULTI_ROBOT_EDITOR]: string;
     [EventType.EVENT_MULTI_ROBOT_SAVE_REQUEST]: string;
+    [EventType.EVENT_MULTI_ROBOT_RUN_CHOICE]: string;
 };
+
+const MULTI_ROBOT_RUN_CHOICE_STORAGE_KEY = 'xrp-multiagent-run-choice-enabled-v1';
+
+function readMultiRobotRunChoiceEnabled(): boolean {
+    if (typeof localStorage === 'undefined') return false;
+    return localStorage.getItem(MULTI_ROBOT_RUN_CHOICE_STORAGE_KEY) === 'on';
+}
 
 /**
  * AppMgr - manages several object instances within the App such as the following
@@ -129,6 +138,7 @@ export default class AppMgr {
     private _folderDataJson : string | null = null;
     private _authService: GoogleAuthService = new GoogleAuthService();
     private _driveService: GoogleDriveService = new GoogleDriveService();
+    private _multiRobotRunChoiceEnabled = readMultiRobotRunChoiceEnabled();
 
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
@@ -215,6 +225,18 @@ export default class AppMgr {
         this._theme = theme;
         this._emitter.emit(EventType.EVENT_THEME, this._theme);
     }        
+
+    public isMultiRobotRunChoiceEnabled(): boolean {
+        return this._multiRobotRunChoiceEnabled;
+    }
+
+    public setMultiRobotRunChoiceEnabled(enabled: boolean): void {
+        this._multiRobotRunChoiceEnabled = enabled;
+        if (typeof localStorage !== 'undefined') {
+            localStorage.setItem(MULTI_ROBOT_RUN_CHOICE_STORAGE_KEY, enabled ? 'on' : 'off');
+        }
+        this.emit(EventType.EVENT_MULTI_ROBOT_RUN_CHOICE, enabled ? 'on' : 'off');
+    }
 
     /**
      * Subscribe to events
@@ -338,6 +360,10 @@ export default class AppMgr {
 
     public getRobotTerminalBuffer(sessionId: string): string {
         return this._connectionMgr?.getRobotTerminalBuffer(sessionId) ?? '';
+    }
+
+    public setRobotTerminalBuffer(sessionId: string, data: string): void {
+        this._connectionMgr?.setRobotTerminalBuffer(sessionId, data);
     }
 
     public subscribeRobotTerminal(sessionId: string, listener: (data: string) => void): () => void {

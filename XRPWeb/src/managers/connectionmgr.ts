@@ -84,6 +84,19 @@ interface RobotFilesystemNode {
     children: RobotFilesystemNode[] | null;
 }
 
+const CURRENT_XRP_NAME_BLOCK_PATTERN =
+    /^# BEGIN XRP IDE ROBOT IDENTITY\r?\ncurrent_XRP_name = .*\r?\n# END XRP IDE ROBOT IDENTITY\r?\n*/;
+
+function buildRobotScopedProgramContent(content: string, alias: string): string {
+    const preamble = [
+        '# BEGIN XRP IDE ROBOT IDENTITY',
+        `current_XRP_name = ${JSON.stringify(alias)}`,
+        '# END XRP IDE ROBOT IDENTITY',
+        '',
+    ].join('\n');
+    return preamble + content.replace(CURRENT_XRP_NAME_BLOCK_PATTERN, '');
+}
+
 /**
  * Owns the legacy active connection and the USB fleet. Only one fleet member is
  * exposed to the existing IDE at a time, while every Web Serial port remains open.
@@ -434,6 +447,12 @@ export default class ConnectionMgr {
         return this.getRobotRecord(sessionId)?.terminalBuffer ?? '';
     }
 
+    public setRobotTerminalBuffer(sessionId: string, data: string): void {
+        const record = this.getRobotRecord(sessionId);
+        if (!record) return;
+        record.terminalBuffer = data;
+    }
+
     public subscribeRobotTerminal(sessionId: string, listener: RobotTerminalListener): () => void {
         if (!this.getRobotRecord(sessionId)) {
             throw new Error(`Unknown XRP session: ${sessionId}`);
@@ -553,7 +572,6 @@ export default class ConnectionMgr {
                 phase = 'checking the team communication library';
                 await this.prepareTeamCommunication(sessionIds);
             }
-            const programByteLength = new TextEncoder().encode(content).length;
             const executionPlans: Array<{
                 sessionId: string;
                 commands: CommandToXRPMgr;
@@ -562,9 +580,11 @@ export default class ConnectionMgr {
             for (const { sessionId, commands } of targets) {
                 const record = this.getRobotRecord(sessionId);
                 const alias = record?.alias ?? sessionId;
+                const robotScopedContent = buildRobotScopedProgramContent(content, alias);
+                const programByteLength = new TextEncoder().encode(robotScopedContent).length;
                 const targetSuffix = targets.length > 1 ? ` to ${alias}` : "";
                 phase = `uploading ${path}${targetSuffix}`;
-                await commands.uploadFile(path, content, false);
+                await commands.uploadFile(path, robotScopedContent, false);
                 phase = `verifying ${path}${targets.length > 1 ? ` on ${alias}` : ""}`;
                 await commands.verifyUploadedFiles([{
                     path,

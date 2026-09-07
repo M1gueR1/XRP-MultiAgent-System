@@ -2719,6 +2719,22 @@ Blockly.Blocks["xrp_team_my_id"] = {
   },
 };
 
+Blockly.Blocks["xrp_team_if_my_name"] = {
+  init: function () {
+    this.appendDummyInput()
+      .appendField("if this XRP name is")
+      .appendField(new Blockly.FieldTextInput("XRP USB 1"), "ROBOT_NAME");
+    this.appendStatementInput("DO")
+      .setCheck(null)
+      .appendField("do");
+    this.setPreviousStatement(true, null);
+    this.setNextStatement(true, null);
+    this.setColour(XRP_TEAM_BLOCK_COLOUR);
+    this.setTooltip("Run the blocks inside only when this XRP has the selected name in Multi-Agent Lab.");
+    this.setHelpUrl("");
+  },
+};
+
 Blockly.Blocks["xrp_team_ready"] = {
   init: function () {
     this.appendDummyInput().appendField("is team communication ready?");

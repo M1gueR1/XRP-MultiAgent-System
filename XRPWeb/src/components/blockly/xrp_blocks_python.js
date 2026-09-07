@@ -24,6 +24,15 @@ function teamMode(block) {
   return block.getFieldValue("MODE") === "EVENT" ? "event" : "latest";
 }
 
+function setupCurrentXRPNameGenerator() {
+  pythonGenerator.definitions_["xrp_current_name_default"] = [
+    "try:",
+    "  current_XRP_name",
+    "except NameError:",
+    '  current_XRP_name = ""',
+  ].join("\n");
+}
+
 pythonGenerator.forBlock["xrp_team_start"] = function () {
   setupTeamCommunicationGenerator();
   pythonGenerator.definitions_["import_time"] = "import time";
@@ -92,6 +101,13 @@ pythonGenerator.forBlock["xrp_team_sender_name"] = function (block) {
 pythonGenerator.forBlock["xrp_team_my_id"] = function () {
   setupTeamCommunicationGenerator();
   return ["xrpTeam.robot_id", pythonGenerator.ORDER_MEMBER];
+};
+
+pythonGenerator.forBlock["xrp_team_if_my_name"] = function (block) {
+  setupCurrentXRPNameGenerator();
+  const robotName = JSON.stringify(String(block.getFieldValue("ROBOT_NAME") || "").trim());
+  const branch = pythonGenerator.statementToCode(block, "DO") || "  pass\n";
+  return `if current_XRP_name == ${robotName}:\n${branch}`;
 };
 
 pythonGenerator.forBlock["xrp_team_ready"] = function () {

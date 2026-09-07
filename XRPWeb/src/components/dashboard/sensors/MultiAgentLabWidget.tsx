@@ -10,7 +10,7 @@ import {
 import AppMgr, { EventType } from "@/managers/appmgr";
 import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import type { BLERobotFleetSnapshot } from "@/connections/bluetoothFleetTypes";
-import type { IDERobotRuntimeState, MultiRobotEditorRequest, PreferredRobotProgramRequest } from "@/connections/ideRobotTypes";
+import type { IDERobotRuntimeState, PreferredRobotProgramRequest } from "@/connections/ideRobotTypes";
 import { useGridStackWidget } from "../hooks/useGridStackWidget";
 import { useGridStackContext } from "../lib";
 import SensorCard from "./SensorCard";
@@ -106,10 +106,10 @@ export default function MultiAgentLabWidget() {
   const [status, setStatus] = useState(INITIAL_STATUS);
   const [target, setTarget] = useState(String(BROADCAST_ROBOT_ID));
   const [showMessageTester, setShowMessageTester] = useState(false);
-  const [showMultiEditorChoices, setShowMultiEditorChoices] = useState(false);
   const [preparingBluetoothSessionId, setPreparingBluetoothSessionId] = useState<string | null>(null);
   const [preferredPrograms, setPreferredPrograms] = useState<Record<string, string>>(() => readPreferredPrograms());
   const [preferredFolders, setPreferredFolders] = useState<Record<string, string>>(() => readPreferredFolders());
+  const [runChoiceEnabled, setRunChoiceEnabled] = useState(() => appMgr.isMultiRobotRunChoiceEnabled());
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
   const connectedIDERobots = [
@@ -131,14 +131,18 @@ export default function MultiAgentLabWidget() {
     const unsubscribeFleet = fleet.subscribe(setSnapshot);
     const handleUSBFleet = (serialized: string) => setUsbSnapshot(JSON.parse(serialized) as USBRobotFleetSnapshot);
     const handleBLEIDEFleet = (serialized: string) => setBleIDESnapshot(JSON.parse(serialized) as BLERobotFleetSnapshot);
+    const handleRunChoiceMode = (state: string) => setRunChoiceEnabled(state === "on");
     appMgr.on(EventType.EVENT_USB_FLEET, handleUSBFleet);
     appMgr.on(EventType.EVENT_BLE_IDE_FLEET, handleBLEIDEFleet);
+    appMgr.on(EventType.EVENT_MULTI_ROBOT_RUN_CHOICE, handleRunChoiceMode);
     setUsbSnapshot(appMgr.getUSBFleetSnapshot());
     setBleIDESnapshot(appMgr.getBluetoothIDEFleetSnapshot());
+    setRunChoiceEnabled(appMgr.isMultiRobotRunChoiceEnabled());
     return () => {
       unsubscribeFleet();
       appMgr.eventOff(EventType.EVENT_USB_FLEET, handleUSBFleet);
       appMgr.eventOff(EventType.EVENT_BLE_IDE_FLEET, handleBLEIDEFleet);
+      appMgr.eventOff(EventType.EVENT_MULTI_ROBOT_RUN_CHOICE, handleRunChoiceMode);
     };
   }, []);
 
@@ -295,33 +299,6 @@ export default function MultiAgentLabWidget() {
     if (event.target === event.currentTarget) closeMessageTester();
   };
 
-  const createMultiRobotEditor = (fileType: "python" | "blockly") => {
-    if (connectedIDERobots.length < 2) {
-      setStatus("Connect at least two IDE robots before creating a multi-XRP program.");
-      return;
-    }
-    const extension = fileType === "python" ? ".py" : ".blocks";
-    const requestedName = window.prompt(
-      `Name for the multi-XRP ${fileType === "python" ? "Python" : "Blockly"} file`,
-      `multi_xrp_program${extension}`,
-    );
-    if (!requestedName) return;
-    const safeBase = requestedName.trim().replace(/[\\/'"\r\n]/g, "_");
-    if (!safeBase) {
-      setStatus("Choose a non-empty file name.");
-      return;
-    }
-    const name = safeBase.endsWith(extension) ? safeBase : `${safeBase}${extension}`;
-    const request: MultiRobotEditorRequest = {
-      fileType,
-      name,
-      sessionIds: connectedIDERobots.map((robot) => robot.sessionId),
-    };
-    appMgr.emit(EventType.EVENT_CREATE_MULTI_ROBOT_EDITOR, JSON.stringify(request));
-    setShowMultiEditorChoices(false);
-    setStatus(`Multi-XRP ${fileType} tab created for ${connectedIDERobots.length} robots. Its Run button is purple.`);
-  };
-
   const updatePreferredProgram = (sessionId: string, path: string) => {
     setPreferredPrograms((current) => {
       const next = { ...current };
@@ -427,22 +404,20 @@ export default function MultiAgentLabWidget() {
             <h2 className="text-base font-bold">Program All XRPs at Once</h2>
           </div>
           <button
-            className="rounded-lg border border-purple-300 bg-purple-700 px-3 py-2 font-bold text-white transition hover:bg-purple-600 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={connectedIDERobots.length < 2}
-            onClick={() => setShowMultiEditorChoices((visible) => !visible)}
+            type="button"
+            aria-pressed={runChoiceEnabled}
+            className={`flex items-center gap-2 rounded-lg border px-3 py-2 font-bold transition ${
+              runChoiceEnabled
+                ? "border-green-300 bg-green-700 text-white hover:bg-green-600"
+                : "border-zinc-500 bg-black text-zinc-200 hover:border-white hover:text-white"
+            }`}
+            onClick={() => appMgr.setMultiRobotRunChoiceEnabled(!runChoiceEnabled)}
           >
-            Control all connected XRPs ({connectedIDERobots.length})
+            <span className={`h-2.5 w-2.5 rounded-full ${runChoiceEnabled ? "bg-green-300" : "bg-zinc-500"}`} />
+            {runChoiceEnabled ? "On" : "Off"}
           </button>
         </div>
         {connectedIDERobots.length < 2 && <p className="mt-2 text-xs text-yellow-300">Connect at least two robots in the USB or Bluetooth IDE fleet.</p>}
-        {showMultiEditorChoices && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-purple-400/60 pt-3">
-            <span className="text-sm">Create:</span>
-            <button className="rounded-lg border border-purple-300 bg-black px-3 py-2 font-bold text-white transition hover:bg-purple-500 hover:text-black" onClick={() => createMultiRobotEditor("python")}>Python file</button>
-            <button className="rounded-lg border border-purple-300 bg-black px-3 py-2 font-bold text-white transition hover:bg-purple-500 hover:text-black" onClick={() => createMultiRobotEditor("blockly")}>Blockly file</button>
-            <span className="text-xs text-gray-300">Targets: {connectedIDERobots.map((robot) => robot.alias).join(", ")}</span>
-          </div>
-        )}
         <div className="mt-3 border-t border-purple-400/60 pt-3">
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <h3 className="mr-auto text-sm font-semibold text-purple-100">Preferred programs</h3>

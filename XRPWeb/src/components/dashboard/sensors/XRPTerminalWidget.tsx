@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FitAddon } from "@xterm/addon-fit";
 import { useXTerm } from "react-xtermjs";
-import { FaTerminal, FaTrash } from "react-icons/fa";
+import { FaEraser, FaTerminal, FaTrash } from "react-icons/fa";
 import type { IDisposable } from "@xterm/xterm";
 import AppMgr, { EventType, Themes } from "@/managers/appmgr";
 import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
@@ -14,6 +14,13 @@ interface XRPTerminalWidgetProps {
 }
 
 const appMgr = AppMgr.getInstance();
+const DEFAULT_MICROPYTHON_PROMPT = "MicroPython\r\n>>> ";
+
+function extractMicroPythonPrompt(buffer: string): string {
+  const matches = [...buffer.matchAll(/MicroPython[\s\S]*?>>> ?/g)];
+  const lastMatch = matches.at(-1);
+  return lastMatch?.[0] ?? DEFAULT_MICROPYTHON_PROMPT;
+}
 
 export default function XRPTerminalWidget({
   sessionId,
@@ -134,6 +141,14 @@ export default function XRPTerminalWidget({
     };
   }, [instance, sessionId]);
 
+  const handleClearTerminal = () => {
+    if (!instance) return;
+    const defaultPrompt = extractMicroPythonPrompt(appMgr.getRobotTerminalBuffer(sessionId));
+    appMgr.setRobotTerminalBuffer(sessionId, defaultPrompt);
+    instance.clear();
+    instance.write(defaultPrompt);
+  };
+
   return (
     <SensorCard
       title={`Terminal — ${displayAlias}`}
@@ -143,7 +158,7 @@ export default function XRPTerminalWidget({
       isConnected={isConnected}
     >
       <div className="relative h-full w-full overflow-hidden">
-        <div className="absolute right-2 top-2 z-10">
+        <div className="absolute right-2 top-2 z-10 flex flex-col gap-2">
           <button
             type="button"
             onClick={handleDelete}
@@ -151,6 +166,14 @@ export default function XRPTerminalWidget({
             title="Close terminal widget"
           >
             <FaTrash size={12} />
+          </button>
+          <button
+            type="button"
+            onClick={handleClearTerminal}
+            className="rounded border border-emerald-300 bg-black/80 p-2 text-emerald-200 transition hover:bg-emerald-500 hover:text-black"
+            title="Clear terminal messages"
+          >
+            <FaEraser size={12} />
           </button>
         </div>
 

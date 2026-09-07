@@ -286,6 +286,7 @@ const ToolboxJson = {
                 { "kind": "BLOCK", "type": "xrp_team_sender" },
                 { "kind": "BLOCK", "type": "xrp_team_sender_name" },
                 { "kind": "BLOCK", "type": "xrp_team_my_id" },
+                { "kind": "BLOCK", "type": "xrp_team_if_my_name" },
                 { "kind": "BLOCK", "type": "xrp_team_ready" },
                 { "kind": "BLOCK", "type": "xrp_team_dashboard_emotion" },
                 { "kind": "BLOCK", "type": "xrp_team_update" }
