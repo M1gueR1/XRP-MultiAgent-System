@@ -291,6 +291,11 @@ export default class AppMgr {
         await this._connectionMgr.addUSBRobot();
     }
 
+    public requestUSBRobotPort(): Promise<SerialPort> {
+        if (!this._connectionMgr) return Promise.reject(new Error('Connection manager is not initialized'));
+        return this._connectionMgr.requestUSBRobotPort();
+    }
+
     public async selectUSBRobot(sessionId: string): Promise<void> {
         if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
         await this._connectionMgr.selectUSBRobot(sessionId);
@@ -403,6 +408,21 @@ export default class AppMgr {
     public async reconnectBluetoothIDERobot(sessionId: string): Promise<void> {
         if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
         await this._connectionMgr.reconnectBluetoothRobot(sessionId);
+    }
+
+    public async retryBluetoothIDERobot(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.retryBluetoothRobot(sessionId);
+    }
+
+    public async repairBluetoothIDERobotOverUSB(sessionId: string, port: SerialPort, onProgress?: (percent: number, message: string) => void): Promise<string | undefined> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        return this._connectionMgr.repairBluetoothRobotOverUSB(sessionId, port, onProgress);
+    }
+
+    public async reconnectBluetoothIDERobotWithChooser(sessionId: string): Promise<void> {
+        if (!this._connectionMgr) throw new Error('Connection manager is not initialized');
+        await this._connectionMgr.reconnectBluetoothRobotWithChooser(sessionId);
     }
 
     public async disconnectBluetoothIDERobot(sessionId: string): Promise<void> {

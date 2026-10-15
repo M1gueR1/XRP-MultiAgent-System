@@ -294,6 +294,7 @@ describe('ConnectionMgr session-bound runs', () => {
         ) as ConnectionMgr & Record<string, unknown>;
         Object.assign(manager, {
             performBLESessionInitialization: performInitialization,
+            bleInitializationQueue: Promise.resolve(),
         });
         const initialize = (
             manager as unknown as {
@@ -303,12 +304,181 @@ describe('ConnectionMgr session-bound runs', () => {
 
         const first = initialize(record);
         const second = initialize(record);
-        await Promise.resolve();
-
-        expect(performInitialization).toHaveBeenCalledOnce();
+        await vi.waitFor(() => expect(performInitialization).toHaveBeenCalledOnce());
         initialization.resolve();
         await Promise.all([first, second]);
         expect(record.initializationPromise).toBeUndefined();
+    });
+
+    it('initializes two BLE IDE sessions one at a time', async () => {
+        const firstInitialization = deferred();
+        const performInitialization = vi.fn()
+            .mockImplementationOnce(() => firstInitialization.promise)
+            .mockResolvedValueOnce(undefined);
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            performBLESessionInitialization: performInitialization,
+            bleInitializationQueue: Promise.resolve(),
+        });
+        const initialize = (
+            manager as unknown as {
+                initializeBLESession: (session: { initializationPromise?: Promise<void> }) => Promise<void>;
+            }
+        ).initializeBLESession.bind(manager);
+        const first = initialize({});
+        const second = initialize({});
+        await vi.waitFor(() => expect(performInitialization).toHaveBeenCalledTimes(1));
+
+        firstInitialization.resolve();
+        await Promise.all([first, second]);
+
+        expect(performInitialization).toHaveBeenCalledTimes(2);
+    });
+
+    it('forces a BLE channel refresh when reconnecting an errored IDE session', async () => {
+        const reconnect = vi.fn(async () => undefined);
+        const initializeBLESession = vi.fn(async () => undefined);
+        const record = {
+            sessionId: 'ble-error',
+            alias: 'XRP B',
+            state: 'error',
+            error: 'REPL write failed',
+            connection: { isConnected: () => true, reconnect },
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            appMgr: { emit: vi.fn() },
+            bleSessions: new Map([[record.sessionId, record]]),
+            initializeBLESession,
+        });
+        reconnect.mockImplementation(async () => { record.state = 'connected'; });
+
+        await manager.reconnectBluetoothRobot(record.sessionId);
+
+        expect(reconnect).toHaveBeenCalledWith(true);
+        expect(initializeBLESession).not.toHaveBeenCalled();
+    });
+
+    it('closes the old BLE link before retrying a full IDE initialization', async () => {
+        const order: string[] = [];
+        const record = {
+            sessionId: 'ble-retry',
+            initialized: true,
+            connection: { disconnect: vi.fn(async () => { order.push('disconnect'); }) },
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            bleSessions: new Map([[record.sessionId, record]]),
+            reconnectBluetoothRobot: vi.fn(async () => {
+                expect(record.initialized).toBe(false);
+                order.push('reconnect');
+            }),
+        });
+
+        await manager.retryBluetoothRobot(record.sessionId);
+
+        expect(order).toEqual(['disconnect', 'reconnect']);
+    });
+
+    it('does not change boot files when the chosen USB port belongs to another XRP', async () => {
+        const port = {} as SerialPort;
+        const executeRawUtility = vi.fn(async () => ['XRP_REPAIR_ID=001122fffff']);
+        const usb = {
+            sessionId: 'usb-other',
+            connection: { getPortHandle: () => port, isConnected: () => true },
+            state: 'connected',
+            runtimeState: 'idle',
+            commands: { BUSY: false, executeRawUtility },
+        };
+        const bluetooth = {
+            sessionId: 'ble-target',
+            deviceName: 'XRP-abcde',
+            connection: { isConnected: () => false },
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map([[usb.sessionId, usb]]),
+            bleSessions: new Map([[bluetooth.sessionId, bluetooth]]),
+        });
+
+        await expect(manager.repairBluetoothRobotOverUSB(bluetooth.sessionId, port))
+            .rejects.toThrow('not XRP-abcde');
+
+        expect(executeRawUtility).toHaveBeenCalledOnce();
+    });
+
+    it('runs a temporary print program before safe boot, then closes USB without reconnecting BLE', async () => {
+        const port = {} as SerialPort;
+        const order: string[] = [];
+        const progress: number[] = [];
+        const executeRawUtility = vi.fn(async (_script: string, sentinel: string) => {
+            if (sentinel === 'XRP_REPAIR_ID_DONE') return ['XRP_REPAIR_ID=001122abcde'];
+            if (sentinel === 'XRP_REPAIR_PROGRAM_DONE') {
+                order.push('run-clean-program');
+                return ['A', 'XRP_REPAIR_PROGRAM_DONE'];
+            }
+            if (sentinel === 'XRP_REPAIR_CLEANUP_DONE') {
+                order.push('remove-clean-program');
+                return ['XRP_REPAIR_CLEANUP_DONE'];
+            }
+            order.push('safe-boot');
+            return [
+                'BOOT_SAFETY:STATUS=OK',
+                'BOOT_SAFETY:BACKUP_PATH=/main_autorun_backup.py',
+                'BOOT_SAFETY:SCRIPT_DONE',
+            ];
+        });
+        const usb = {
+            sessionId: 'usb-target',
+            connection: {
+                getPortHandle: () => port,
+                isConnected: () => true,
+                writeToDevice: vi.fn(async () => { order.push('reset'); }),
+                disconnect: vi.fn(async () => { order.push('close-usb'); }),
+            },
+            state: 'connected',
+            runtimeState: 'idle',
+            commands: {
+                BUSY: false,
+                executeRawUtility,
+                prepareForRun: vi.fn(async () => { order.push('prepare'); }),
+                uploadFile: vi.fn(async () => { order.push('upload-clean-program'); }),
+            },
+        };
+        const bluetooth = {
+            sessionId: 'ble-target',
+            deviceName: 'XRP-abcde',
+            connection: { isConnected: () => false },
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map([[usb.sessionId, usb]]),
+            bleSessions: new Map([[bluetooth.sessionId, bluetooth]]),
+            reconnectBluetoothRobot: vi.fn(async () => { order.push('retry-ble'); }),
+        });
+
+        const backup = await manager.repairBluetoothRobotOverUSB(
+            bluetooth.sessionId,
+            port,
+            (percent) => progress.push(percent),
+        );
+
+        expect(backup).toBe('/main_autorun_backup.py');
+        expect(usb.commands.uploadFile).toHaveBeenCalledWith(expect.stringMatching(/^\/__xrp_ble_repair_.*\.py$/), 'print("A")\n', false);
+        expect(usb.connection.writeToDevice).toHaveBeenCalledWith('import machine; machine.reset()\r');
+        expect(order).toEqual(['prepare', 'upload-clean-program', 'run-clean-program', 'remove-clean-program', 'safe-boot', 'reset', 'close-usb']);
+        expect(progress.at(-1)).toBe(100);
+        expect(manager.reconnectBluetoothRobot).not.toHaveBeenCalled();
     });
 
     it('keeps the active IDE session and files visible while GATT is automatically reconnecting', async () => {
@@ -808,6 +978,7 @@ describe('ConnectionMgr session-bound runs', () => {
             connection: {
                 hasRuntimeDataChannel: () => true,
                 hasDedicatedRuntimeDataChannel: () => false,
+                supportsRuntimeUartWithoutResponse: () => false,
             },
             state: 'connected',
             runtimeState: 'idle',
@@ -856,6 +1027,7 @@ describe('ConnectionMgr session-bound runs', () => {
             connection: {
                 hasRuntimeDataChannel: () => true,
                 hasDedicatedRuntimeDataChannel: () => false,
+                supportsRuntimeUartWithoutResponse: () => false,
             },
             state: 'connected',
             runtimeState: 'idle',
@@ -936,11 +1108,69 @@ describe('ConnectionMgr session-bound runs', () => {
             path: '/lib/MultiAgentLib/_transport_config.py',
             content: 'TRANSPORT = "bluetooth_uart"\n',
         });
+        expect(commands.uploadFile).toHaveBeenCalledWith(
+            '/lib/MultiAgentLib/.bluetooth_preloaded',
+            'XRP_MULTI_AGENT_BLUETOOTH_PRELOADED_V1\n',
+            false,
+        );
         expect(commands.updateMainFile).not.toHaveBeenCalled();
         expect(commands.executeLines).not.toHaveBeenCalled();
         expect(usb.multiAgentLibraryInstalled).toBe(true);
         expect(usb.teamTransportConfigured).toBe(true);
+        expect((usb as typeof usb & { bluetoothContextPreloaded?: boolean }).bluetoothContextPreloaded).toBe(true);
         expect((usb as typeof usb & { teamTransportMode?: string }).teamTransportMode).toBe('bluetooth_uart');
+    });
+
+    it('recognizes a preloaded context from the marker on a later Bluetooth session', async () => {
+        const bluetooth = {
+            sessionId: 'ble-preloaded',
+            alias: 'XRP B',
+            connection: {},
+            state: 'connected',
+            runtimeState: 'idle',
+            initialized: true,
+            resumeActive: false,
+            terminalBuffer: '',
+            filesystemCache: JSON.stringify([{
+                name: '/',
+                path: '/',
+                children: [{
+                    name: 'lib',
+                    path: '/',
+                    children: [{
+                        name: 'MultiAgentLib',
+                        path: '/lib',
+                        children: [{
+                            name: '.bluetooth_preloaded',
+                            path: '/lib/MultiAgentLib',
+                            children: null,
+                        }],
+                    }],
+                }],
+            }]),
+            commands: { BUSY: false },
+            multiAgentLibraryInstalled: false,
+            teamTransportConfigured: false,
+            bluetoothContextPreloaded: false,
+        };
+        const manager = Object.create(
+            (await import('@/managers/connectionmgr')).default.prototype,
+        ) as ConnectionMgr & Record<string, unknown>;
+        Object.assign(manager, {
+            usbSessions: new Map(),
+            bleSessions: new Map([[bluetooth.sessionId, bluetooth]]),
+            activeUSBSessionId: null,
+            activeBLESessionId: bluetooth.sessionId,
+        });
+
+        (
+            manager as unknown as {
+                updateBluetoothPreloadState: (record: typeof bluetooth) => void;
+            }
+        ).updateBluetoothPreloadState(bluetooth);
+
+        expect(bluetooth.bluetoothContextPreloaded).toBe(true);
+        expect(manager.getBLEFleetSnapshot().sessions[0].bluetoothContextPreloaded).toBe(true);
     });
 
     it('switches the cached transport configuration when moving between Bluetooth preparation and USB runs', async () => {
@@ -992,6 +1222,12 @@ describe('ConnectionMgr session-bound runs', () => {
         );
         expect(commands.uploadFile).toHaveBeenNthCalledWith(
             2,
+            '/lib/MultiAgentLib/.bluetooth_preloaded',
+            'XRP_MULTI_AGENT_BLUETOOTH_PRELOADED_V1\n',
+            false,
+        );
+        expect(commands.uploadFile).toHaveBeenNthCalledWith(
+            3,
             '/lib/MultiAgentLib/_transport_config.py',
             'TRANSPORT = "usb"\n',
             false,

@@ -4,6 +4,7 @@ import Connection, { ConnectionState } from '@connections/connection';
 import TableMgr from '@/managers/tablemgr';
 import AppMgr, { EventType } from '@/managers/appmgr';
 import { encodeUSBTeamFrame, USBTeamFrameParser } from '@/multiagent/transport/USBSerialTeamFraming';
+import type { TransportWriteDiagnostics } from '@/multiagent/transport/RobotTransport';
 
 /**
  * BluetoothConnection class
@@ -50,10 +51,13 @@ export class BluetoothConnection extends Connection {
     private recoveringGatt: boolean = false;
     private readonly runtimeUARTFrameParser = new USBTeamFrameParser();
     private readonly maximumWriteAttempts = 3;
-    private readonly notificationStabilizationMs = 200;
+    private readonly notificationStabilizationMs = 300;
     // Twenty bytes works with the default BLE ATT MTU used by both XRP
     // firmware generations. MultiAgentLib's stream parser reassembles frames.
     private readonly runtimeWriteChunkSize = 20;
+    private runtimeUartWithoutResponseRequests = 0;
+    private runtimeUart55Requests = 0;
+    private runtimeUart55Profile?: { generation: number; writer: BluetoothRemoteGATTCharacteristic };
 
     private  Table: TableMgr | undefined = undefined;
 
@@ -288,8 +292,13 @@ export class BluetoothConnection extends Connection {
     }
 
     private async handleGATTDisconnected(): Promise<void> {
+        if (this.bleDevice?.gatt?.connected) {
+            if (this.suppressManagerCallback) this.disconnectGeneration += 1;
+            return;
+        }
         this.disconnectGeneration += 1;
         this.connectionStates = ConnectionState.Disconnected;
+        this.invalidateGATTCharacteristics();
         const shouldRecover = this.autoReconnect && !this.manualDisconnect && Boolean(this.bleDevice);
         this.recoveringGatt = shouldRecover;
         await this.onDisconnected();
@@ -354,12 +363,39 @@ export class BluetoothConnection extends Connection {
             if (device.gatt?.connected) device.gatt.disconnect();
             if (!device.gatt) throw new Error('The selected XRP does not expose a Bluetooth GATT server.');
             const server = await device.gatt.connect();
+            if (this.manualDisconnect) {
+                server.disconnect();
+                throw new Error('Bluetooth connection was cancelled.');
+            }
             await this.discoverCharacteristics(server);
+            if (this.manualDisconnect || !device.gatt.connected) {
+                throw new Error('The XRP disconnected during Bluetooth service discovery.');
+            }
             this.attachDisconnectListener(device);
             gattReady = true;
             this.reconnectSuccess = true;
             await this.onConnected();
         } catch (error) {
+            let connectionError = error;
+            if (
+                gattReady &&
+                this.autoReconnect &&
+                !this.manualDisconnect &&
+                this.isTransientWriteError(error)
+            ) {
+                try {
+                    await this.recoverGATTConnection(true);
+                    await this.onConnected();
+                    AppMgr.getInstance().emit(
+                        EventType.EVENT_HIDE_BLUETOOTH_CONNECTING,
+                        'hide-bluetooth-connecting',
+                    );
+                    return;
+                } catch (recoveryError) {
+                    connectionError = recoveryError;
+                }
+            }
+
             const keepPhysicalConnection =
                 gattReady &&
                 this.bleDevice?.gatt?.connected === true &&
@@ -373,42 +409,67 @@ export class BluetoothConnection extends Connection {
                     'hide-bluetooth-connecting',
                 );
                 throw new Error(
-                    `BLE IDE initialization failed: ${error instanceof Error ? error.message : String(error)}. ` +
-                    'The Bluetooth link is still connected; use Reconnect on this XRP to retry initialization.',
+                    `BLE IDE initialization failed: ${connectionError instanceof Error ? connectionError.message : String(connectionError)}. ` +
+                    'Bluetooth GATT is connected, but the IDE is not ready; use Reconnect on this XRP to retry initialization.',
                 );
             }
             this.connectionStates = ConnectionState.Disconnected;
             this.manualDisconnect = true;
             if (this.bleDevice?.gatt?.connected) this.bleDevice.gatt.disconnect();
             AppMgr.getInstance().emit(EventType.EVENT_HIDE_BLUETOOTH_CONNECTING, 'hide-bluetooth-connecting');
-            throw new Error(`BLE connection failed: ${error instanceof Error ? error.message : String(error)}`);
+            throw new Error(`BLE connection failed: ${connectionError instanceof Error ? connectionError.message : String(connectionError)}`);
         }
     }
 
     public async disconnect(): Promise<void> {
         this.manualDisconnect = true;
         this.connectionStates = ConnectionState.Disconnected;
-        try { await this.bleReader?.stopNotifications(); } catch { /* already stopped */ }
-        try { await this.bleDataReader?.stopNotifications(); } catch { /* optional characteristic */ }
         if (this.bleDevice?.gatt?.connected) this.bleDevice.gatt.disconnect();
-        this.bleWriter = undefined;
-        this.bleReader = undefined;
-        this.bleDataWriter = undefined;
-        this.bleDataReader = undefined;
+        const stopNotifications = Promise.allSettled([
+            Promise.resolve().then(() => this.bleReader?.stopNotifications()),
+            Promise.resolve().then(() => this.bleDataReader?.stopNotifications()),
+        ]);
+        let stopTimeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([
+                stopNotifications,
+                new Promise<void>((resolve) => {
+                    stopTimeout = setTimeout(resolve, 1500);
+                }),
+            ]);
+        } finally {
+            if (stopTimeout) clearTimeout(stopTimeout);
+        }
+        this.invalidateGATTCharacteristics();
         await this.onDisconnected();
     }
 
-    public async reconnect(): Promise<void> {
+    public async reconnectWithDeviceChooser(): Promise<void> {
+        if (!navigator.bluetooth || !this.bleDevice) {
+            throw new Error('The Bluetooth XRP is no longer available.');
+        }
+        const selected = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'XRP' }],
+            optionalServices: [this.UART_SERVICE_UUID],
+        });
+        if (selected.id !== this.bleDevice.id) {
+            throw new Error('Select the same XRP that was repaired over USB.');
+        }
+        this.bleDevice = selected;
+        await this.reconnect(true);
+    }
+
+    public async reconnect(forceRediscovery: boolean = false): Promise<void> {
         if (!this.bleDevice?.gatt) {
             await this.connect();
             return;
         }
-        if (this.isConnected() && this.bleDevice.gatt.connected && this.bleWriter && this.bleReader) return;
+        if (!forceRediscovery && this.isConnected() && this.bleDevice.gatt.connected && this.bleWriter && this.bleReader) return;
         this.manualDisconnect = false;
         this.disconnectNotified = false;
         let physicalConnectionReady = false;
         try {
-            await this.recoverGATTConnection();
+            await this.recoverGATTConnection(forceRediscovery);
             physicalConnectionReady = true;
             await this.onConnected();
         } catch (error) {
@@ -431,6 +492,10 @@ export class BluetoothConnection extends Connection {
         if (this.manualDisconnect) {
             throw new Error('Bluetooth reconnection was cancelled because the XRP was disconnected manually.');
         }
+        if (this.gattRecoveryPromise) {
+            await this.gattRecoveryPromise;
+            if (this.bleDevice?.gatt?.connected && this.bleWriter && this.bleReader) return;
+        }
         if (
             !forceRediscovery &&
             this.connectionStates === ConnectionState.Connected &&
@@ -440,22 +505,38 @@ export class BluetoothConnection extends Connection {
         ) {
             return;
         }
-        if (this.gattRecoveryPromise) {
-            await this.gattRecoveryPromise;
-            return;
-        }
         if (!this.bleDevice?.gatt) {
             throw new Error('The selected XRP does not expose a Bluetooth GATT server.');
         }
 
         const recovery = (async () => {
             this.connectionStates = ConnectionState.Busy;
-            const server = this.bleDevice!.gatt!.connected
-                ? this.bleDevice!.gatt!
-                : await this.connectWithTimeout(this.bleDevice!, 10000);
-            await this.discoverCharacteristics(server);
-            this.reconnectSuccess = true;
-            this.markPhysicalConnectionReady();
+            this.invalidateGATTCharacteristics();
+            let lastError: unknown;
+            for (let attempt = 1; attempt <= this.maximumWriteAttempts; attempt += 1) {
+                if (this.manualDisconnect) throw new Error('Bluetooth reconnection was cancelled.');
+                try {
+                    const server = this.bleDevice!.gatt!.connected
+                        ? this.bleDevice!.gatt!
+                        : await this.connectWithTimeout(this.bleDevice!, 10000);
+                    await this.discoverCharacteristics(server);
+                    if (!server.connected || this.manualDisconnect) {
+                        throw new Error('The XRP disconnected during Bluetooth service discovery.');
+                    }
+                    this.reconnectSuccess = true;
+                    this.markPhysicalConnectionReady();
+                    return;
+                } catch (error) {
+                    lastError = error;
+                    this.invalidateGATTCharacteristics();
+                    this.connLogger.debug(`BLE GATT recovery attempt ${attempt} failed: ${error instanceof Error ? error.message : String(error)}`);
+                    if (attempt < this.maximumWriteAttempts && !this.manualDisconnect) {
+                        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+                    }
+                }
+            }
+            this.connectionStates = ConnectionState.Disconnected;
+            throw lastError;
         })();
         this.gattRecoveryPromise = recovery;
         try {
@@ -480,6 +561,16 @@ export class BluetoothConnection extends Connection {
         await this.bleReader.startNotifications();
         if (this.bleDataReader) await this.bleDataReader.startNotifications();
         await new Promise((resolve) => setTimeout(resolve, this.notificationStabilizationMs));
+    }
+
+    private invalidateGATTCharacteristics(): void {
+        this.btService = undefined;
+        this.bleWriter = undefined;
+        this.bleReader = undefined;
+        this.bleDataWriter = undefined;
+        this.bleDataReader = undefined;
+        this.bleData = null;
+        this.ble2Data = null;
     }
 
     private attachDisconnectListener(device: BluetoothDevice): void {
@@ -530,7 +621,43 @@ export class BluetoothConnection extends Connection {
         }
     }
 
-    public async writeRuntimeData(data: Uint8Array): Promise<void> {
+    public supportsRuntimeUartWithoutResponse(): boolean {
+        return !this.bleDataWriter && this.bleWriter?.properties?.writeWithoutResponse === true &&
+            typeof this.bleWriter.writeValueWithoutResponse === 'function';
+    }
+
+    public useRuntimeUartWithoutResponse(chunkSizeBytes: 20 | 55 = 20): () => void {
+        if (chunkSizeBytes !== 20 && chunkSizeBytes !== 55) {
+            throw new RangeError('UART experiment chunk size must be 20 or 55 bytes.');
+        }
+        if (!this.supportsRuntimeUartWithoutResponse()) {
+            throw new Error('This XRP does not advertise UART writes without response. Prepare its BLE library over USB and reconnect.');
+        }
+        if (chunkSizeBytes === 55) {
+            if (!this.isConnected()) throw new Error('Connect the XRP before selecting 55-byte UART writes.');
+            if (this.runtimeUart55Profile) this.requireUart55Profile(this.runtimeUart55Profile);
+            else this.runtimeUart55Profile = { generation: this.disconnectGeneration, writer: this.bleWriter! };
+            this.runtimeUart55Requests += 1;
+        }
+        this.runtimeUartWithoutResponseRequests += 1;
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            this.runtimeUartWithoutResponseRequests -= 1;
+            if (chunkSizeBytes === 55 && --this.runtimeUart55Requests === 0) this.runtimeUart55Profile = undefined;
+        };
+    }
+
+    private requireUart55Profile(profile: { generation: number; writer: BluetoothRemoteGATTCharacteristic }): void {
+        if (profile.generation !== this.disconnectGeneration || profile.writer !== this.bleWriter) {
+            throw new Error('Bluetooth changed during the 55-byte experiment. Recheck the XRP MTU and RX buffer before a new test.');
+        }
+    }
+
+    public async writeRuntimeData(data: Uint8Array, diagnostics?: TransportWriteDiagnostics): Promise<void> {
+        const uartWithoutResponse = this.runtimeUartWithoutResponseRequests > 0;
+        const uart55Profile = this.runtimeUart55Requests > 0 ? this.runtimeUart55Profile : undefined;
         await this.ensureREPLChannel();
         if (!this.hasRuntimeDataChannel()) {
             throw new Error('The XRP Bluetooth runtime channel is not connected.');
@@ -539,13 +666,48 @@ export class BluetoothConnection extends Connection {
             // Older XRP firmware has only the BLE UART characteristics. During
             // a running program that UART behaves like stdin/stdout, so reuse
             // the same ASCII-safe framing proven by the USB transport.
-            await this.bleQueue(encodeUSBTeamFrame(data));
+            const framed = encodeUSBTeamFrame(data);
+            // Larger frames retain the existing conservative chunking policy.
+            const uartChunkSize = uart55Profile && framed.length <= 55 ? 55 : this.runtimeWriteChunkSize;
+            if (diagnostics) Object.assign(diagnostics, {
+                channel: 'ble-uart', encodedBytes: framed.length, chunks: 1, attempts: 0, retries: 0,
+                writeMode: uartWithoutResponse ? 'without-response' :
+                    typeof this.bleWriter?.writeValueWithResponse === 'function' ? 'with-response' : 'legacy',
+                chunkSizeBytes: uartWithoutResponse ? uartChunkSize : framed.length,
+            });
+            if (uartWithoutResponse) {
+                if (!this.supportsRuntimeUartWithoutResponse()) {
+                    throw new Error('UART writes without response are no longer available on this XRP.');
+                }
+                if (diagnostics) diagnostics.chunks = 0;
+                await this.enqueueGattWrite(async () => {
+                    if (uart55Profile) this.requireUart55Profile(uart55Profile);
+                    for (let offset = 0; offset < framed.length; offset += uartChunkSize) {
+                        const chunk = framed.slice(offset, offset + uartChunkSize);
+                        if (diagnostics) diagnostics.chunks = (diagnostics.chunks ?? 0) + 1;
+                        await this.writeWithRetry(async () => {
+                            if (uart55Profile) this.requireUart55Profile(uart55Profile);
+                            if (!this.supportsRuntimeUartWithoutResponse()) {
+                                throw new Error('UART writes without response are unavailable after Bluetooth recovery.');
+                            }
+                            await this.bleWriter!.writeValueWithoutResponse(chunk as BufferSource);
+                        }, 'Bluetooth UART runtime', diagnostics);
+                    }
+                }, diagnostics);
+                return;
+            }
+            await this.bleQueue(framed, diagnostics);
             return;
         }
+        if (diagnostics) Object.assign(diagnostics, {
+            channel: 'ble-data', encodedBytes: data.length, chunks: 0, attempts: 0, retries: 0,
+            chunkSizeBytes: this.runtimeWriteChunkSize,
+        });
         await this.enqueueGattWrite(async () => {
             if (!this.bleDataWriter) throw new Error('The XRP Bluetooth DATA writer is unavailable.');
             for (let offset = 0; offset < data.length; offset += this.runtimeWriteChunkSize) {
                 const chunk = data.slice(offset, offset + this.runtimeWriteChunkSize);
+                if (diagnostics) diagnostics.chunks = (diagnostics.chunks ?? 0) + 1;
                 await this.writeWithRetry(async () => {
                     if (!this.bleDataWriter) {
                         throw new Error('The XRP Bluetooth DATA writer is unavailable.');
@@ -554,13 +716,15 @@ export class BluetoothConnection extends Connection {
                         this.bleDataWriter.properties.writeWithoutResponse &&
                         typeof this.bleDataWriter.writeValueWithoutResponse === 'function'
                     ) {
+                        if (diagnostics) diagnostics.writeMode = 'without-response';
                         await this.bleDataWriter.writeValueWithoutResponse(chunk as BufferSource);
                     } else {
+                        if (diagnostics) diagnostics.writeMode = 'legacy';
                         await this.bleDataWriter.writeValue(chunk as BufferSource);
                     }
-                }, 'Bluetooth DATA');
+                }, 'Bluetooth DATA', diagnostics);
             }
-        });
+        }, diagnostics);
     }
 
     private str2ab(str: string): ArrayBuffer {
@@ -585,12 +749,12 @@ export class BluetoothConnection extends Connection {
     }
 
     private async ensureREPLChannel(): Promise<void> {
-        const gattIsAvailable = this.bleDevice?.gatt?.connected !== false;
-        if (this.isConnected() && this.bleWriter && gattIsAvailable) return;
+        if (this.gattRecoveryPromise) await this.gattRecoveryPromise;
+        if (this.isConnected() && this.bleWriter && this.bleDevice?.gatt?.connected !== false) return;
         if (this.autoReconnect && !this.manualDisconnect && this.bleDevice) {
             await this.recoverGATTConnection();
         }
-        if (!this.isConnected() || !this.bleWriter) {
+        if (!this.isConnected() || !this.bleWriter || this.bleDevice?.gatt?.connected === false) {
             throw new Error('The XRP Bluetooth REPL channel is not connected.');
         }
     }
@@ -615,20 +779,32 @@ export class BluetoothConnection extends Connection {
      *  bleQueue - If we haven't come back from the ble.writeValue then the GATT is still busy and we will miss items that are being sent
      * This can be seen if you type very fast in the Shell 
      */
-    private async bleQueue(value: BufferSource) {
+    private async bleQueue(value: BufferSource, diagnostics?: TransportWriteDiagnostics) {
         await this.enqueueGattWrite(async () => {
             if (!this.bleWriter) {
                 throw new Error('The XRP Bluetooth REPL writer is unavailable.');
             }
             await this.writeWithRetry(
-                () => this.bleWriter!.writeValue(value),
+                () => typeof this.bleWriter!.writeValueWithResponse === 'function'
+                    ? this.bleWriter!.writeValueWithResponse(value)
+                    : this.bleWriter!.writeValue(value),
                 'Bluetooth REPL',
+                diagnostics,
             );
-        });
+        }, diagnostics);
     }
 
-    private async enqueueGattWrite(operation: () => Promise<void>): Promise<void> {
-        const write = this.gattWriteQueue.catch(() => undefined).then(operation);
+    private async enqueueGattWrite(operation: () => Promise<void>, diagnostics?: TransportWriteDiagnostics): Promise<void> {
+        const enqueuedAt = diagnostics ? performance.now() : 0;
+        const write = this.gattWriteQueue.catch(() => undefined).then(async () => {
+            const startedAt = diagnostics ? performance.now() : 0;
+            if (diagnostics) diagnostics.gattQueueMs = startedAt - enqueuedAt;
+            try {
+                await operation();
+            } finally {
+                if (diagnostics) diagnostics.gattOperationMs = performance.now() - startedAt;
+            }
+        });
         this.gattWriteQueue = write.catch(() => undefined);
         await write;
     }
@@ -636,9 +812,16 @@ export class BluetoothConnection extends Connection {
     private async writeWithRetry(
         operation: () => Promise<void>,
         channel: string,
+        diagnostics?: TransportWriteDiagnostics,
     ): Promise<void> {
         let lastError: unknown;
+        let attempted = 0;
         for (let attempt = 1; attempt <= this.maximumWriteAttempts; attempt += 1) {
+            attempted = attempt;
+            if (diagnostics) {
+                diagnostics.attempts = (diagnostics.attempts ?? 0) + 1;
+                if (attempt > 1) diagnostics.retries = (diagnostics.retries ?? 0) + 1;
+            }
             try {
                 await operation();
                 return;
@@ -662,12 +845,12 @@ export class BluetoothConnection extends Connection {
                 ) {
                     break;
                 }
-                await new Promise((resolve) => setTimeout(resolve, attempt * 75));
+                await new Promise((resolve) => setTimeout(resolve, attempt * 150));
             }
         }
         const detail = lastError instanceof Error ? lastError.message : String(lastError);
         throw new Error(
-            `${channel} write failed after ${this.maximumWriteAttempts} attempts: ${detail}`,
+            `${channel} write failed after ${attempted} attempt${attempted === 1 ? '' : 's'}: ${detail}`,
         );
     }
 
@@ -682,7 +865,7 @@ export class BluetoothConnection extends Connection {
             name === 'NetworkError' ||
             name === 'OperationError' ||
             name === 'UnknownError' ||
-            /gatt.*(?:failed|busy|progress|disconnect)|temporar|network|reconnect first/i.test(detail)
+            /gatt.*(?:failed|busy|progress|disconnect)|temporar|network|reconnect first|characteristic.*no longer valid|retrieve.*characteristic.*after reconnect/i.test(detail)
         );
     }
 
@@ -690,7 +873,7 @@ export class BluetoothConnection extends Connection {
         const detail = error instanceof Error ? error.message : String(error);
         return (
             this.bleDevice?.gatt?.connected === false ||
-            /gatt server is disconnected|cannot perform gatt operation|reconnect first|not connected/i.test(detail)
+            /gatt server is disconnected|cannot perform gatt operation|gatt operation failed(?: for unknown reason)?|reconnect first|not connected|characteristic.*no longer valid|retrieve.*characteristic.*after reconnect/i.test(detail)
         );
     }
 
@@ -714,8 +897,10 @@ export class BluetoothConnection extends Connection {
             const deadline = Date.now() + 15000;
             while (Date.now() < deadline) {
                 if (this.disconnectGeneration > startingDisconnectGeneration &&
-                    this.connectionStates === ConnectionState.Connected) {
-                    return true;
+                    this.connectionStates === ConnectionState.Connected &&
+                    this.bleDevice?.gatt?.connected) {
+                    if (await this.checkPrompt()) return true;
+                    await new Promise((resolve) => setTimeout(resolve, 250));
                 }
                 await new Promise((resolve) => setTimeout(resolve, 50));
             }

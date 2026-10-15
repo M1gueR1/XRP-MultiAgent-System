@@ -2,6 +2,7 @@ import type ConnectionMgr from '@/managers/connectionmgr';
 import { BluetoothConnection } from '@/connections/bluetoothconnection';
 import { ConnectionState } from '@/connections/connection';
 import { describe, expect, it, vi } from 'vitest';
+import type { TransportWriteDiagnostics } from '@/multiagent/transport/RobotTransport';
 
 vi.mock('@/managers/appmgr', () => ({
     default: {
@@ -19,6 +20,170 @@ type MutableBluetoothConnection = {
 };
 
 describe('BluetoothConnection write reliability', () => {
+    it('sends the unchanged 55-byte frame in one experimental UART write and keeps larger frames conservative', async () => {
+        const withResponse = vi.fn(async () => undefined);
+        const withoutResponse = vi.fn(async (_bytes: BufferSource) => undefined);
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, {
+            connectionStates: ConnectionState.Connected,
+            bleWriter: { properties: { writeWithoutResponse: true }, writeValueWithResponse: withResponse,
+                writeValueWithoutResponse: withoutResponse },
+        });
+        const release20 = connection.useRuntimeUartWithoutResponse(20);
+        const release55 = connection.useRuntimeUartWithoutResponse(55);
+        const diagnostics: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), diagnostics);
+        expect(diagnostics).toMatchObject({ encodedBytes: 55, chunkSizeBytes: 55, chunks: 1, attempts: 1, retries: 0 });
+        expect(new TextDecoder().decode(withoutResponse.mock.calls[0][0] as BufferSource)).toBe('__XRPMA__:' + '00'.repeat(22) + '\n');
+        await connection.writeToDevice('print("A")');
+        expect(withResponse).toHaveBeenCalledOnce();
+        const larger: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(23), larger);
+        expect(larger).toMatchObject({ encodedBytes: 57, chunkSizeBytes: 20, chunks: 3 });
+        expect(withoutResponse.mock.calls.slice(1).map(([data]) => data.byteLength)).toEqual([20, 20, 17]);
+        release55();
+        release55();
+        const restored20: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), restored20);
+        expect(restored20).toMatchObject({ chunkSizeBytes: 20, chunks: 3 });
+        release20();
+        const restoredNormal: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), restoredNormal);
+        expect(restoredNormal).toMatchObject({ writeMode: 'with-response', chunkSizeBytes: 55, chunks: 1 });
+    });
+
+    it.each(['generation', 'writer'])('rejects a stale 55-byte lease after a Bluetooth %s change', async (change) => {
+        const withoutResponse = vi.fn(async () => undefined);
+        const writer = { properties: { writeWithoutResponse: true }, writeValueWithoutResponse: withoutResponse,
+            writeValueWithResponse: vi.fn(async () => undefined) };
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, { connectionStates: ConnectionState.Connected, bleWriter: writer });
+        const release = connection.useRuntimeUartWithoutResponse(55);
+        Object.assign(connection, change === 'generation' ? { disconnectGeneration: 1 } : { bleWriter: { ...writer } });
+        await expect(connection.writeRuntimeData(new Uint8Array(22))).rejects.toThrow('Bluetooth changed');
+        expect(withoutResponse).not.toHaveBeenCalled();
+        expect(() => connection.useRuntimeUartWithoutResponse(55)).toThrow('Bluetooth changed');
+        release();
+        const newRelease = connection.useRuntimeUartWithoutResponse(55);
+        await expect(connection.writeRuntimeData(new Uint8Array(22))).resolves.toBeUndefined();
+        expect(withoutResponse).toHaveBeenCalledOnce();
+        newRelease();
+    });
+
+    it('never silently falls back when a 55-byte write is rejected and restores the normal path after release', async () => {
+        const withoutResponse = vi.fn(async () => { throw new DOMException('MTU too small', 'InvalidModificationError'); });
+        const withResponse = vi.fn(async () => undefined);
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, { connectionStates: ConnectionState.Connected,
+            bleWriter: { properties: { writeWithoutResponse: true }, writeValueWithoutResponse: withoutResponse,
+                writeValueWithResponse: withResponse } });
+        const release = connection.useRuntimeUartWithoutResponse(55);
+        const diagnostics: TransportWriteDiagnostics = { channel: 'unknown' };
+        await expect(connection.writeRuntimeData(new Uint8Array(22), diagnostics)).rejects.toThrow('failed after 1 attempt');
+        expect(withoutResponse).toHaveBeenCalledOnce();
+        expect(diagnostics).toMatchObject({ attempts: 1, retries: 0 });
+        expect(withResponse).not.toHaveBeenCalled();
+        release();
+        await connection.writeRuntimeData(new Uint8Array(22));
+        expect(withResponse).toHaveBeenCalledOnce();
+        expect(() => connection.useRuntimeUartWithoutResponse(21 as 20)).toThrow('20 or 55');
+    });
+
+    it('uses bounded UART runtime chunks only during the experiment and preserves explicit REPL responses', async () => {
+        const withResponse = vi.fn(async () => undefined);
+        const withoutResponse = vi.fn(async (_bytes: BufferSource) => undefined);
+        const legacy = vi.fn(async () => undefined);
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, {
+            connectionStates: ConnectionState.Connected,
+            bleWriter: { properties: { writeWithoutResponse: true }, writeValueWithResponse: withResponse,
+                writeValueWithoutResponse: withoutResponse, writeValue: legacy },
+        });
+        const firstRelease = connection.useRuntimeUartWithoutResponse();
+        const secondRelease = connection.useRuntimeUartWithoutResponse();
+        firstRelease();
+        firstRelease();
+        const diagnostics: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), diagnostics);
+        expect(diagnostics).toMatchObject({ channel: 'ble-uart', writeMode: 'without-response', encodedBytes: 55,
+            chunks: 3, attempts: 3, retries: 0 });
+        expect(withoutResponse.mock.calls.map(([bytes]) => (bytes as BufferSource).byteLength)).toEqual([20, 20, 15]);
+        const chunks = withoutResponse.mock.calls.map(([bytes]) => new Uint8Array(bytes as ArrayBuffer));
+        expect(new TextDecoder().decode(Uint8Array.from(chunks.flatMap((chunk) => [...chunk])))).toBe('__XRPMA__:' + '00'.repeat(22) + '\n');
+        await connection.writeToDevice('print("A")');
+        expect(withResponse).toHaveBeenCalledOnce();
+        expect(withoutResponse).toHaveBeenCalledTimes(3);
+        secondRelease();
+        const restored: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), restored);
+        expect(restored).toMatchObject({ writeMode: 'with-response', chunks: 1, attempts: 1 });
+        expect(withResponse).toHaveBeenCalledTimes(2);
+        expect(legacy).not.toHaveBeenCalled();
+    });
+
+    it('rejects the UART experiment if the robot does not advertise support', () => {
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, { bleWriter: { properties: { writeWithoutResponse: false },
+            writeValue: vi.fn(), writeValueWithoutResponse: vi.fn() } });
+        expect(connection.supportsRuntimeUartWithoutResponse()).toBe(false);
+        expect(() => connection.useRuntimeUartWithoutResponse()).toThrow('does not advertise');
+    });
+
+    it('records DATA chunk count, GATT waiting and transient write retries without changing packet sizes', async () => {
+        const blocker = deferredWrite();
+        const replWrite = vi.fn(() => blocker.promise);
+        const dataWrite = vi.fn()
+            .mockRejectedValueOnce(new DOMException('GATT busy', 'NetworkError'))
+            .mockResolvedValue(undefined);
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, {
+            connectionStates: ConnectionState.Connected,
+            bleWriter: { writeValue: replWrite },
+            bleDataWriter: { properties: { writeWithoutResponse: true }, writeValueWithoutResponse: dataWrite },
+        });
+        const diagnostics: TransportWriteDiagnostics = { channel: 'unknown' };
+        const repl = connection.writeToDevice('hold');
+        const data = connection.writeRuntimeData(new Uint8Array(22), diagnostics);
+        await vi.waitFor(() => expect(replWrite).toHaveBeenCalledOnce());
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        blocker.resolve();
+        await Promise.all([repl, data]);
+        expect(diagnostics).toMatchObject({ channel: 'ble-data', encodedBytes: 22, chunks: 2, attempts: 3, retries: 1 });
+        expect(diagnostics.gattQueueMs).toBeGreaterThanOrEqual(10);
+        expect(diagnostics.gattOperationMs).toBeGreaterThanOrEqual(100);
+        expect(dataWrite.mock.calls.map(([bytes]) => bytes.byteLength)).toEqual([20, 20, 2]);
+    });
+
+    it('records UART framing as 55 encoded bytes for a 22-byte probe', async () => {
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, {
+            connectionStates: ConnectionState.Connected,
+            bleWriter: { writeValue: vi.fn(async () => undefined) },
+        });
+        const diagnostics: TransportWriteDiagnostics = { channel: 'unknown' };
+        await connection.writeRuntimeData(new Uint8Array(22), diagnostics);
+        expect(diagnostics).toMatchObject({ channel: 'ble-uart', encodedBytes: 55, chunks: 1, attempts: 1, retries: 0 });
+        expect(diagnostics.gattQueueMs).toBeGreaterThanOrEqual(0);
+        expect(diagnostics.gattOperationMs).toBeGreaterThanOrEqual(0);
+    });
+    it('asks for the repaired XRP again and rejects a different Bluetooth device', async () => {
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        Object.assign(connection, { bleDevice: { id: 'repaired-xrp' } });
+        const reconnect = vi.spyOn(connection, 'reconnect').mockResolvedValue();
+        const requestDevice = vi.fn()
+            .mockResolvedValueOnce({ id: 'another-xrp' })
+            .mockResolvedValueOnce({ id: 'repaired-xrp' });
+        vi.stubGlobal('navigator', { bluetooth: { requestDevice } });
+        try {
+            await expect(connection.reconnectWithDeviceChooser()).rejects.toThrow('same XRP');
+            expect(reconnect).not.toHaveBeenCalled();
+            await expect(connection.reconnectWithDeviceChooser()).resolves.toBeUndefined();
+            expect(reconnect).toHaveBeenCalledWith(true);
+        } finally {
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('bounds and retries the Raw REPL transition instead of waiting forever', async () => {
         const writeValue = vi.fn(async () => undefined);
         const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
@@ -72,6 +237,7 @@ describe('BluetoothConnection write reliability', () => {
             }),
         };
         const server = {
+            get connected() { return gatt.connected; },
             getPrimaryService: vi.fn(async () => service),
         };
         const gatt = {
@@ -98,6 +264,151 @@ describe('BluetoothConnection write reliability', () => {
         expect(firstWrite).toHaveBeenCalledOnce();
         expect(gatt.connect).toHaveBeenCalledOnce();
         expect(recoveredWrite).toHaveBeenCalledOnce();
+    });
+
+    it('rediscovers and retries a REPL characteristic that became invalid after reconnecting', async () => {
+        const firstWrite = vi.fn(async () => {
+            throw new DOMException(
+                'Characteristic with UUID 6e400002-b5a3-f393-e0a9-e50e24dcca9e is no longer valid. Remember to retrieve the characteristic again after reconnecting.',
+                'InvalidStateError',
+            );
+        });
+        const recoveredWrite = vi.fn(async () => undefined);
+        const replReader = {
+            startNotifications: vi.fn(async () => replReader),
+            addEventListener: vi.fn(),
+        };
+        const service = {
+            getCharacteristic: vi.fn(async (uuid: string) => {
+                if (uuid.endsWith('0002-b5a3-f393-e0a9-e50e24dcca9e')) {
+                    return { writeValue: recoveredWrite };
+                }
+                if (uuid.endsWith('0003-b5a3-f393-e0a9-e50e24dcca9e')) return replReader;
+                throw new Error('Optional DATA characteristic unavailable');
+            }),
+        };
+        const gatt = {
+            connected: true,
+            getPrimaryService: vi.fn(async () => service),
+        };
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: true });
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Connected,
+            bleDevice: { gatt },
+            bleWriter: { writeValue: firstWrite },
+            readWorkerRunning: true,
+            notificationStabilizationMs: 0,
+        });
+
+        await expect(connection.writeToDevice('first')).resolves.toBeUndefined();
+
+        expect(firstWrite).toHaveBeenCalledOnce();
+        expect(gatt.getPrimaryService).toHaveBeenCalledOnce();
+        expect(recoveredWrite).toHaveBeenCalledOnce();
+    });
+
+    it('refreshes cached characteristics when Reconnect is pressed after IDE initialization fails', async () => {
+        const refreshedWrite = vi.fn(async () => undefined);
+        const replReader = {
+            startNotifications: vi.fn(async () => replReader),
+            addEventListener: vi.fn(),
+        };
+        const gatt = {
+            connected: true,
+            getPrimaryService: vi.fn(async () => ({
+                getCharacteristic: vi.fn(async (uuid: string) => {
+                    if (uuid.endsWith('0002-b5a3-f393-e0a9-e50e24dcca9e')) {
+                        return { writeValue: refreshedWrite };
+                    }
+                    if (uuid.endsWith('0003-b5a3-f393-e0a9-e50e24dcca9e')) return replReader;
+                    throw new Error('Optional DATA characteristic unavailable');
+                }),
+            })),
+        };
+        const connectCallback = vi.fn(async () => undefined);
+        const connection = new BluetoothConnection(
+            { connectCallback } as unknown as ConnectionMgr,
+            { autoReconnect: true },
+        );
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Connected,
+            bleDevice: { gatt },
+            bleWriter: { writeValue: vi.fn(async () => undefined) },
+            bleReader: replReader,
+            readWorkerRunning: true,
+            notificationStabilizationMs: 0,
+        });
+
+        await connection.reconnect(true);
+        await connection.writeToDevice('retry');
+
+        expect(gatt.getPrimaryService).toHaveBeenCalledOnce();
+        expect(refreshedWrite).toHaveBeenCalledOnce();
+        expect(connectCallback).toHaveBeenCalledOnce();
+    });
+
+    it('retries service discovery if GATT drops before the channel is ready', async () => {
+        let notificationStarts = 0;
+        const replReader = {
+            startNotifications: vi.fn(async () => {
+                notificationStarts += 1;
+                if (notificationStarts === 1) gatt.connected = false;
+                return replReader;
+            }),
+            addEventListener: vi.fn(),
+        };
+        const gatt = {
+            connected: true,
+            connect: vi.fn(async () => {
+                gatt.connected = true;
+                return gatt;
+            }),
+            getPrimaryService: vi.fn(async () => ({
+                getCharacteristic: vi.fn(async (uuid: string) => {
+                    if (uuid.endsWith('0003-b5a3-f393-e0a9-e50e24dcca9e')) return replReader;
+                    if (uuid.endsWith('0002-b5a3-f393-e0a9-e50e24dcca9e')) {
+                        return { writeValue: vi.fn(async () => undefined) };
+                    }
+                    throw new Error('Optional DATA characteristic unavailable');
+                }),
+            })),
+        };
+        const connection = new BluetoothConnection(
+            { connectCallback: vi.fn(async () => undefined) } as unknown as ConnectionMgr,
+            { autoReconnect: true },
+        );
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Disconnected,
+            bleDevice: { gatt },
+            readWorkerRunning: true,
+            notificationStabilizationMs: 0,
+        });
+
+        await connection.reconnect(true);
+
+        expect(gatt.getPrimaryService).toHaveBeenCalledTimes(2);
+        expect(gatt.connect).toHaveBeenCalledOnce();
+        expect(connection.isConnected()).toBe(true);
+    });
+
+    it('verifies the MicroPython prompt after the stop command reconnects', async () => {
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        const checkPrompt = vi.spyOn(connection, 'checkPrompt')
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
+        const writeToDevice = vi.spyOn(connection, 'writeToDevice').mockImplementation(async () => {
+            Object.assign(connection, { disconnectGeneration: 1 });
+        });
+        Object.assign(connection as unknown as MutableBluetoothConnection, {
+            connectionStates: ConnectionState.Connected,
+            bleDevice: { gatt: { connected: true } },
+        });
+
+        await expect(connection.getToREPL()).resolves.toBe(true);
+
+        expect(checkPrompt).toHaveBeenCalledTimes(3);
+        expect(writeToDevice).toHaveBeenCalledWith('##XRPSTOP##');
     });
 
     it('retries a transient DATA write before reporting an error', async () => {
@@ -290,7 +601,7 @@ describe('BluetoothConnection write reliability', () => {
 
         try {
             await expect(connection.connect()).rejects.toThrow(
-                'Bluetooth link is still connected',
+                'Bluetooth GATT is connected, but the IDE is not ready',
             );
             expect(connection.isConnected()).toBe(true);
             expect(disconnect).not.toHaveBeenCalled();

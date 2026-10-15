@@ -4,7 +4,6 @@ import { useXTerm } from "react-xtermjs";
 import { FaEraser, FaTerminal, FaTrash } from "react-icons/fa";
 import type { IDisposable } from "@xterm/xterm";
 import AppMgr, { EventType, Themes } from "@/managers/appmgr";
-import type { USBRobotFleetSnapshot } from "@/connections/usbFleetTypes";
 import { useGridStackWidget } from "../hooks/useGridStackWidget";
 import SensorCard from "./SensorCard";
 
@@ -31,33 +30,33 @@ export default function XRPTerminalWidget({
   const terminalHostRef = useRef<HTMLDivElement>(null);
   const inputListenerRef = useRef<IDisposable | null>(null);
   const [displayAlias, setDisplayAlias] = useState(alias);
-  const [isConnected, setIsConnected] = useState(() =>
-    appMgr.getUSBFleetSnapshot().sessions.some(
-      (session) => session.sessionId === sessionId && session.state === "connected",
-    ),
-  );
+  const [isConnected, setIsConnected] = useState(() => {
+    const session = [
+      ...appMgr.getUSBFleetSnapshot().sessions,
+      ...appMgr.getBluetoothIDEFleetSnapshot().sessions,
+    ].find((candidate) => candidate.sessionId === sessionId);
+    return session?.state === "connected";
+  });
 
   useEffect(() => {
-    const handleUSBFleet = (serialized: string) => {
-      try {
-        const snapshot = JSON.parse(serialized) as USBRobotFleetSnapshot;
-        const session = snapshot.sessions.find((candidate) => candidate.sessionId === sessionId);
-        if (session) {
-          setDisplayAlias(session.alias);
-          setIsConnected(session.state === "connected");
-        } else {
-          setIsConnected(false);
-        }
-      } catch {
-        setIsConnected(false);
-      }
-    };
+    const syncRobotSession = () => {
+      const session = [
+        ...appMgr.getUSBFleetSnapshot().sessions,
+        ...appMgr.getBluetoothIDEFleetSnapshot().sessions,
+      ].find((candidate) => candidate.sessionId === sessionId);
 
-    appMgr.on(EventType.EVENT_USB_FLEET, handleUSBFleet);
-    handleUSBFleet(JSON.stringify(appMgr.getUSBFleetSnapshot()));
+      if (session) setDisplayAlias(session.alias);
+      setIsConnected(session?.state === "connected");
+    };
+    const handleFleetChange = () => syncRobotSession();
+
+    appMgr.on(EventType.EVENT_USB_FLEET, handleFleetChange);
+    appMgr.on(EventType.EVENT_BLE_IDE_FLEET, handleFleetChange);
+    syncRobotSession();
 
     return () => {
-      appMgr.eventOff(EventType.EVENT_USB_FLEET, handleUSBFleet);
+      appMgr.eventOff(EventType.EVENT_USB_FLEET, handleFleetChange);
+      appMgr.eventOff(EventType.EVENT_BLE_IDE_FLEET, handleFleetChange);
     };
   }, [sessionId]);
 

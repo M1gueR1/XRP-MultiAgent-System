@@ -1,16 +1,17 @@
-import { MultiAgentFlag, MultiAgentTopic } from "../protocol/constants";
+import { MultiAgentFlag, MultiAgentMessageKind, MultiAgentTopic } from "../protocol/constants";
 import type { MultiAgentMessage } from "../protocol/message";
 import { encodeMultiAgentMessage, encodeXppPacket } from "../protocol/message";
 import { XppMessageType } from "../protocol/constants";
 import type { RobotTransport } from "../transport/RobotTransport";
 import { monotonicNow } from "./metrics";
-import type { RobotSessionMetrics } from "./types";
+import type { PingWriteDiagnostics, RobotSessionMetrics } from "./types";
 
 interface ScheduledWrite {
   message: MultiAgentMessage;
   packet: Uint8Array;
   enqueuedAt: number;
   retries: number;
+  diagnostics?: PingWriteDiagnostics;
   resolve: () => void;
   reject: (error: Error) => void;
 }
@@ -36,6 +37,7 @@ export class RobotWriteScheduler {
   private readonly normalQueue: ScheduledWrite[] = [];
   private readonly pendingAcks = new Map<string, PendingAck>();
   private writing = false;
+  private activeWrite?: ScheduledWrite;
   private stopped = false;
   private readonly maximumNormalQueue: number;
   private readonly maximumReliableQueue: number;
@@ -57,18 +59,34 @@ export class RobotWriteScheduler {
     this.maximumRetries = options.maximumRetries ?? 2;
   }
 
-  enqueue(message: MultiAgentMessage): Promise<void> {
+  get hasPendingWrites(): boolean {
+    return this.writing || this.highPriorityQueue.length > 0 || this.reliableQueue.length > 0
+      || this.latestOnly.size > 0 || this.normalQueue.length > 0;
+  }
+
+  enqueue(message: MultiAgentMessage, diagnostics?: PingWriteDiagnostics): Promise<void> {
     if (this.stopped) return Promise.reject(new Error("Robot write scheduler is stopped."));
     const packet = encodeXppPacket(
       XppMessageType.MULTI_AGENT,
       encodeMultiAgentMessage(message),
     );
+    if (diagnostics) {
+      diagnostics.packetBytes = packet.length;
+      diagnostics.queueDepthAtEnqueue = this.metrics.outgoingQueueDepth;
+      diagnostics.activeWriteAtEnqueue = this.activeWrite ? this.describeWrite(this.activeWrite) : "";
+      diagnostics.queuedWritesAtEnqueue = this.queuedWrites().map((write) => this.describeWrite(write)).join("|");
+      diagnostics.pendingAcksAtEnqueue = this.pendingAcks.size;
+      diagnostics.blockingWrites = 0;
+      diagnostics.blockingWriteMs = 0;
+      diagnostics.blockingMessageKinds = "";
+    }
     return new Promise<void>((resolve, reject) => {
       const write: ScheduledWrite = {
         message,
         packet,
         enqueuedAt: monotonicNow(),
         retries: 0,
+        diagnostics,
         resolve,
         reject,
       };
@@ -163,8 +181,21 @@ export class RobotWriteScheduler {
           write.reject(new Error("Message expired before it could be sent."));
           continue;
         }
+        this.activeWrite = write;
+        const writeStartedAt = monotonicNow();
         try {
-          await this.transport.writeData(write.packet);
+          if (write.diagnostics) {
+            const startedAt = monotonicNow();
+            write.diagnostics.schedulerQueueMs = startedAt - write.enqueuedAt;
+            try {
+              await this.transport.writeData(write.packet, write.diagnostics);
+            } finally {
+              write.diagnostics.writeFinishedAt = monotonicNow();
+              write.diagnostics.transportCallMs = write.diagnostics.writeFinishedAt - startedAt;
+            }
+          } else {
+            await this.transport.writeData(write.packet);
+          }
           this.metrics.messagesSent += 1;
           this.metrics.bytesSent += write.packet.length;
           this.metrics.lastSentAt = Date.now();
@@ -176,6 +207,18 @@ export class RobotWriteScheduler {
         } catch (error) {
           this.metrics.messagesDropped += 1;
           write.reject(error instanceof Error ? error : new Error(String(error)));
+        } finally {
+          const finishedAt = monotonicNow();
+          for (const queued of this.queuedWrites()) {
+            if (!queued.diagnostics) continue;
+            const overlap = Math.max(0, finishedAt - Math.max(writeStartedAt, queued.enqueuedAt));
+            queued.diagnostics.blockingWrites = (queued.diagnostics.blockingWrites ?? 0) + 1;
+            queued.diagnostics.blockingWriteMs = (queued.diagnostics.blockingWriteMs ?? 0) + overlap;
+            const kinds = new Set(queued.diagnostics.blockingMessageKinds?.split("|").filter(Boolean));
+            kinds.add(this.describeWrite(write));
+            queued.diagnostics.blockingMessageKinds = [...kinds].join("|");
+          }
+          this.activeWrite = undefined;
         }
         this.updateDepth();
       }
@@ -215,6 +258,19 @@ export class RobotWriteScheduler {
       void this.drain();
     }, this.acknowledgementTimeoutMs);
     this.pendingAcks.set(key, { write, timer });
+  }
+
+  private queuedWrites(): ScheduledWrite[] {
+    return [...this.highPriorityQueue, ...this.reliableQueue, ...this.latestOnly.values(), ...this.normalQueue];
+  }
+
+  private describeWrite(write: ScheduledWrite): string {
+    const kind = Object.entries(MultiAgentMessageKind).find(([, value]) => value === write.message.messageKind)?.[0]
+      ?? `0x${write.message.messageKind.toString(16)}`;
+    if (write.message.messageKind !== MultiAgentMessageKind.DATA) return kind;
+    const topic = Object.entries(MultiAgentTopic).find(([, value]) => value === write.message.topicId)?.[0]
+      ?? `0x${write.message.topicId.toString(16)}`;
+    return `${kind}:${topic}`;
   }
 
   private clearQueuedDriveCommands(): void {

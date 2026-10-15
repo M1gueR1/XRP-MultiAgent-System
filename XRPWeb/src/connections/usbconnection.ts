@@ -10,6 +10,13 @@ import { encodeUSBTeamFrame, USBTeamFrameParser } from '@/multiagent/transport/U
  * USB Connection - establish USB serial connection to the XRP Robot
  */
 export class USBConnection extends Connection {
+    public static requestRobotPort(): Promise<SerialPort> {
+        return navigator.serial.requestPort({ filters: [
+            { usbVendorId: 11914, usbProductId: 5 },
+            { usbVendorId: 6991, usbProductId: 70 },
+            { usbVendorId: 0x2E8A, usbProductId: 0x110A },
+        ] });
+    }
     // Define USB connection variables
     private port: SerialPort | undefined = undefined;
     private reader: ReadableStreamDefaultReader<Uint8Array> | undefined = undefined; // Reference to serial port reader, only one can be locked at a time
@@ -297,27 +304,23 @@ export class USBConnection extends Connection {
     /**
      * connection - creates an async connection and return result via promise
      */
-    public async connect(): Promise<void> {
+    public async connect(selectedPort?: SerialPort): Promise<void> {
         if (this.connectionStates == ConnectionState.Busy) {
             return;
         }
 
-        const autoConnected = this.manualOnly ? false : await this.tryAutoConnect();
-
-        const filters = [
-            { usbVendorId: this.USB_VENDOR_ID_BETA, usbProductId: this.USB_PRODUCT_ID_BETA },
-            { usbVendorId: this.USB_VENDOR_ID, usbProductId: this.USB_PRODUCT_ID },
-            { usbVendorId: this.USB_VENDOR_ID_NANOXRP, usbProductId: this.USB_PRODUCT_ID_NANOXRP },
-        ];
+        const autoConnected = selectedPort || this.manualOnly ? false : await this.tryAutoConnect();
 
         if (!autoConnected) {
             this.connLogger.debug('Trying to perform a manual USB cable connection');
             this.connectionStates = ConnectionState.Busy;
             this.isManualConnection = true;
 
-            await navigator.serial
-                .requestPort({ filters })
+            await (selectedPort ? Promise.resolve(selectedPort) : USBConnection.requestRobotPort())
                 .then(async (port) => {
+                    if (!this.checkPortMatching(port)) {
+                        throw new Error('The selected USB port is not an XRP controller.');
+                    }
                     if (this.connMgr?.isUSBPortClaimed(port, this)) {
                         throw new Error('That XRP is already connected. Choose a different USB port.');
                     }

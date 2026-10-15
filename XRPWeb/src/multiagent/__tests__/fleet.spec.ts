@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   BROADCAST_ROBOT_ID,
   LAPTOP_COORDINATOR_ID,
@@ -11,6 +11,7 @@ import {
 import { defaultVirtualCapabilities, encodeHelloPayload } from "../protocol/capabilities";
 import { RobotFleetManager } from "../fleet/RobotFleetManager";
 import { VirtualRobotTransport } from "../transport/VirtualRobotTransport";
+import { decodeMultiAgentMessage, decodeXppPacket, type MultiAgentMessage } from "../protocol/message";
 
 const managers: RobotFleetManager[] = [];
 
@@ -35,6 +36,24 @@ async function createFleet(count: number): Promise<{ manager: RobotFleetManager;
   return { manager, transports };
 }
 
+function capturePings(transport: VirtualRobotTransport): MultiAgentMessage[] {
+  const pings: MultiAgentMessage[] = [];
+  const write = transport.writeData.bind(transport);
+  vi.spyOn(transport, "writeData").mockImplementation(async (packet) => {
+    const message = decodeMultiAgentMessage(decodeXppPacket(packet).payload);
+    if (message.messageKind === MultiAgentMessageKind.PING) pings.push(message);
+    else await write(packet);
+  });
+  return pings;
+}
+
+function replyToPing(transport: VirtualRobotTransport, ping: MultiAgentMessage): void {
+  transport.sendFromRobot({
+    messageKind: MultiAgentMessageKind.PONG, flags: 0, targetRobotId: LAPTOP_COORDINATOR_ID,
+    topicId: 0, ttlMilliseconds: 2000, applicationPayload: ping.applicationPayload,
+  });
+}
+
 afterEach(async () => {
   for (const manager of managers.splice(0)) {
     for (const session of [...manager.getSessions()]) await manager.removeRobot(session.sessionId);
@@ -42,6 +61,175 @@ afterEach(async () => {
 });
 
 describe("RobotFleetManager routing", () => {
+  it("waits for the heartbeat write and bounds unanswered automatic probes", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"] });
+    try {
+      const setup = createFleet(1);
+      await vi.advanceTimersByTimeAsync(20);
+      const { manager, transports } = await setup;
+      const session = manager.getReadySessions()[0];
+      const transport = transports[0];
+      const write = transport.writeData.bind(transport);
+      const pings: MultiAgentMessage[] = [];
+      vi.spyOn(transport, "writeData").mockImplementation(async (packet) => {
+        const message = decodeMultiAgentMessage(decodeXppPacket(packet).payload);
+        if (message.messageKind === MultiAgentMessageKind.PING) pings.push(message);
+        else {
+          if (message.messageKind === MultiAgentMessageKind.HEARTBEAT) await new Promise((resolve) => setTimeout(resolve, 200));
+          await write(packet);
+        }
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pings).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(pings).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pings).toHaveLength(1);
+      session.metrics.lastHeartbeatAt = Date.now();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pings).toHaveLength(2);
+      expect(transport.receivedMessages.filter((message) => message.messageKind === MultiAgentMessageKind.HEARTBEAT)).toHaveLength(3);
+      replyToPing(transport, pings[0]);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pings).toHaveLength(2);
+      replyToPing(transport, pings[1]);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pings).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips automatic probes behind queued traffic but retains explicit test probes", async () => {
+    vi.useFakeTimers();
+    try {
+      const setup = createFleet(1);
+      await vi.advanceTimersByTimeAsync(20);
+      const { manager, transports } = await setup;
+      const session = manager.getReadySessions()[0];
+      const transport = transports[0];
+      const write = transport.writeData.bind(transport);
+      let finishHeartbeat!: () => void;
+      let finishData!: () => void;
+      const pings: MultiAgentMessage[] = [];
+      vi.spyOn(transport, "writeData").mockImplementation(async (packet) => {
+        const message = decodeMultiAgentMessage(decodeXppPacket(packet).payload);
+        if (message.messageKind === MultiAgentMessageKind.PING) pings.push(message);
+        if (message.messageKind === MultiAgentMessageKind.HEARTBEAT) await new Promise<void>((resolve) => { finishHeartbeat = resolve; });
+        if (message.messageKind === MultiAgentMessageKind.DATA) await new Promise<void>((resolve) => { finishData = resolve; });
+        await write(packet);
+      });
+      await vi.advanceTimersByTimeAsync(1000);
+      const data = manager.publish({ targetRobotId: session.robotId!, topicId: MultiAgentTopic.SYSTEM_TEST,
+        payload: Uint8Array.of(1), qos: "normal", ttlMs: 2000 });
+      const probe = manager.pingForTest(session.robotId!);
+      finishHeartbeat();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pings).toHaveLength(0);
+      finishData();
+      await vi.advanceTimersByTimeAsync(1);
+      await data;
+      const result = await probe;
+      expect(pings).toHaveLength(1);
+      expect(result).toMatchObject({ status: "received", diagnostics: {
+        automaticPingsSkipped: 1, activeWriteAtEnqueue: "HEARTBEAT", queuedWritesAtEnqueue: "DATA:SYSTEM_TEST",
+        blockingWrites: 2, blockingMessageKinds: "HEARTBEAT|DATA:SYSTEM_TEST",
+      } });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("exports stable probe timings and cancels a pending probe without stopping the session", async () => {
+    const { manager, transports } = await createFleet(1);
+    const robotId = manager.getReadySessions()[0].robotId!;
+    const received = await manager.pingForTest(robotId);
+    expect(received.diagnostics).toMatchObject({ channel: "unknown", packetBytes: 22 });
+    expect(received.diagnostics?.transportCallMs).toBeGreaterThanOrEqual(0);
+    expect(received.afterWriteMs).toBeGreaterThanOrEqual(0);
+    const snapshot = { ...received.diagnostics };
+    const pings = capturePings(transports[0]);
+    const controller = new AbortController();
+    const pending = manager.pingForTest(robotId, 5000, controller.signal);
+    await waitUntil(() => pings.length === 1);
+    controller.abort();
+    expect(await pending).toMatchObject({ status: "error", detail: "Test cancelled." });
+    expect(manager.getReadySessions()).toHaveLength(1);
+    expect(received.diagnostics).toEqual(snapshot);
+  });
+
+  it("pauses automatic pings with nested releases but keeps heartbeats and explicit probes", async () => {
+    vi.useFakeTimers();
+    const setup = createFleet(1);
+    await vi.advanceTimersByTimeAsync(20);
+    const { manager, transports } = await setup;
+    const robotId = manager.getReadySessions()[0].robotId!;
+    const releaseFirst = manager.pauseAutomaticPings(robotId);
+    const releaseSecond = manager.pauseAutomaticPings(robotId);
+    try {
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(transports[0].receivedMessages.some((message) => message.messageKind === MultiAgentMessageKind.HEARTBEAT)).toBe(true);
+      expect(transports[0].receivedMessages.some((message) => message.messageKind === MultiAgentMessageKind.PING)).toBe(false);
+      await manager.ping(robotId);
+      releaseFirst();
+      releaseFirst();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(transports[0].receivedMessages.filter((message) => message.messageKind === MultiAgentMessageKind.PING)).toHaveLength(1);
+      releaseSecond();
+      manager.getReadySessions()[0].metrics.lastHeartbeatAt = Date.now();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(transports[0].receivedMessages.filter((message) => message.messageKind === MultiAgentMessageKind.PING)).toHaveLength(2);
+    } finally {
+      releaseFirst();
+      releaseSecond();
+      vi.useRealTimers();
+    }
+  });
+  it("correlates manual tests by robot and ping sequence despite background replies", async () => {
+    const { manager, transports } = await createFleet(2);
+    const first = manager.getReadySessions()[0];
+    const pings = capturePings(transports[0]);
+    let completed = false;
+    const test = manager.pingForTest(first.robotId!).then((result) => { completed = true; return result; });
+    await waitUntil(() => pings.length === 1);
+    await manager.ping(first.robotId!);
+    replyToPing(transports[0], pings[1]);
+    replyToPing(transports[1], pings[0]);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(completed).toBe(false);
+    replyToPing(transports[0], pings[0]);
+    const result = await test;
+    expect(result).toMatchObject({ robotId: first.robotId, sequence: pings[0].sequence, status: "received" });
+    expect(result.rttMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("expires unanswered tests and does not attribute a late reply to the next test", async () => {
+    const { manager, transports } = await createFleet(1);
+    const robotId = manager.getReadySessions()[0].robotId!;
+    const pings = capturePings(transports[0]);
+    const expired = await manager.pingForTest(robotId, 30);
+    expect(expired.status).toBe("timeout");
+    let completed = false;
+    const next = manager.pingForTest(robotId).then((result) => { completed = true; return result; });
+    await waitUntil(() => pings.length === 2);
+    replyToPing(transports[0], pings[0]);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(completed).toBe(false);
+    replyToPing(transports[0], pings[1]);
+    expect((await next).status).toBe("received");
+    expect(expired.rttMs).toBeUndefined();
+  });
+
+  it("finishes pending manual tests when their robot session disconnects", async () => {
+    const { manager, transports } = await createFleet(1);
+    const session = manager.getReadySessions()[0];
+    const pings = capturePings(transports[0]);
+    const test = manager.pingForTest(session.robotId!);
+    await waitUntil(() => pings.length === 1);
+    await manager.disconnectRobot(session.sessionId);
+    expect(await test).toMatchObject({ status: "error", detail: "Robot session stopped during the test." });
+  });
+
   it("routes laptop unicast only to one robot and broadcast to every ready robot", async () => {
     const { manager, transports } = await createFleet(3);
     const firstId = manager.getReadySessions()[0].robotId!;

@@ -12,6 +12,7 @@ export * from "./fleet/types";
 export * from "./fleet/RobotSession";
 export * from "./fleet/RobotFleetManager";
 export * from "./benchmark/FleetBenchmark";
+export * from "./benchmark/SingleRobotRttTest";
 export * from "./adapters/EmotionMultiAgentAdapter";
 export * from "./simulation/runVirtualFleetSimulation";
 export * from "./runtime/multiAgentLibraryBundle";

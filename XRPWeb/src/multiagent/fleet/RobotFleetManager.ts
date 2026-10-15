@@ -17,6 +17,8 @@ import { monotonicNow, RttTracker } from "./metrics";
 import { RobotSession } from "./RobotSession";
 import type {
   FleetSnapshot,
+  PingWriteDiagnostics,
+  PingTestResult,
   PublishRequest,
   RobotSessionSnapshot,
   RoutingLogEntry,
@@ -44,6 +46,15 @@ export class RobotFleetManager {
   private readonly routingLog: RoutingLogEntry[] = [];
   private readonly recentMessages = new Map<string, number>();
   private readonly pingStartedAt = new Map<string, number>();
+  private readonly pendingPingTests = new Map<string, {
+    result: PingTestResult;
+    timeout: ReturnType<typeof setTimeout>;
+    resolve: (result: PingTestResult) => void;
+    removeAbortListener?: () => void;
+  }>();
+  private readonly automaticPingPauses = new Map<string, number>();
+  private readonly automaticPings = new Map<string, { key: string; expiresAt: number }>();
+  private readonly automaticPingSkips = new Map<string, number>();
   private readonly rttTrackers = new Map<string, RttTracker>();
   private readonly externalSessions = new Map<string, string>();
   private readonly preferProvidedAlias = new Set<string>();
@@ -64,7 +75,10 @@ export class RobotFleetManager {
       transport,
       {
         onMessage: (source, message, arrivedAt) => void this.handleIncoming(source, message, arrivedAt),
-        onStateChanged: () => this.notify(),
+        onStateChanged: (source) => {
+          if (source.state === "disconnected" || source.state === "error") this.clearAutomaticPing(source.sessionId);
+          this.notify();
+        },
       },
     );
     this.sessions.set(sessionId, session);
@@ -109,6 +123,7 @@ export class RobotFleetManager {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     if (session.robotId !== undefined) this.forgetRecentMessagesFrom(session.robotId);
+    this.cancelPingTests(sessionId);
     for (const key of this.pingStartedAt.keys()) {
       if (key.startsWith(`${sessionId}:`)) this.pingStartedAt.delete(key);
     }
@@ -136,6 +151,7 @@ export class RobotFleetManager {
 
   async removeRobot(sessionId: string): Promise<void> {
     const session = this.requireSession(sessionId);
+    this.cancelPingTests(sessionId);
     if (session.robotId !== undefined) this.robotIds.delete(session.robotId);
     await session.disconnect();
     session.dispose();
@@ -162,11 +178,13 @@ export class RobotFleetManager {
   }
 
   async disconnectRobot(sessionId: string): Promise<void> {
+    this.cancelPingTests(sessionId);
     await this.requireSession(sessionId).disconnect();
     this.notify();
   }
 
   async disconnectAll(): Promise<void> {
+    for (const sessionId of this.sessions.keys()) this.cancelPingTests(sessionId);
     await Promise.all([...this.sessions.values()].map((session) => session.disconnect()));
     this.stopHeartbeatIfIdle();
     this.notify();
@@ -231,10 +249,63 @@ export class RobotFleetManager {
     const session = this.getSessionByRobotId(robotId);
     if (!session || session.state !== "ready") throw new Error(`Robot ${robotId} is not ready.`);
     const sequence = session.nextSequence();
+    const key = `${session.sessionId}:${sequence}`;
+    this.pingStartedAt.set(key, monotonicNow());
+    try {
+      await session.send(this.createPingMessage(robotId, sequence));
+    } catch (error) {
+      this.pingStartedAt.delete(key);
+      throw error;
+    }
+  }
+
+  /** Pauses only automatic probes, never heartbeat or explicit test messages. */
+  pauseAutomaticPings(robotId: number): () => void {
+    const session = this.getSessionByRobotId(robotId);
+    if (!session || session.state !== "ready") throw new Error(`Robot ${robotId} is not ready.`);
+    const id = session.sessionId;
+    this.automaticPingPauses.set(id, (this.automaticPingPauses.get(id) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const remaining = (this.automaticPingPauses.get(id) ?? 1) - 1;
+      if (remaining > 0) this.automaticPingPauses.set(id, remaining);
+      else this.automaticPingPauses.delete(id);
+    };
+  }
+
+  async pingForTest(robotId: number, timeoutMs = 5000, signal?: AbortSignal): Promise<PingTestResult> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError("Ping timeout must be positive.");
+    const session = this.getSessionByRobotId(robotId);
+    if (!session || session.state !== "ready") throw new Error(`Robot ${robotId} is not ready.`);
+    const sequence = session.nextSequence();
+    const key = `${session.sessionId}:${sequence}`;
+    const diagnostics: PingWriteDiagnostics = { channel: session.transport.runtimeChannel ?? "unknown" };
+    const result: PingTestResult = { robotId, sequence, startedAt: Date.now(), status: "timeout", diagnostics };
+    if (signal?.aborted) return { ...result, status: "error", detail: "Test cancelled." };
+    this.pingStartedAt.set(key, monotonicNow());
+    return new Promise<PingTestResult>((resolve) => {
+      this.pendingPingTests.set(key, {
+        result,
+        timeout: setTimeout(() => this.finishPingTest(key, "timeout"), timeoutMs),
+        resolve,
+      });
+      if (signal) {
+        const abort = () => this.finishPingTest(key, "error", undefined, "Test cancelled.");
+        signal.addEventListener("abort", abort, { once: true });
+        this.pendingPingTests.get(key)!.removeAbortListener = () => signal.removeEventListener("abort", abort);
+      }
+      void session.send(this.createPingMessage(robotId, sequence), diagnostics).catch((error: unknown) => {
+        this.finishPingTest(key, "error", undefined, error instanceof Error ? error.message : String(error));
+      });
+    });
+  }
+
+  private createPingMessage(robotId: number, sequence: number): MultiAgentMessage {
     const payload = new Uint8Array(2);
     new DataView(payload.buffer).setUint16(0, sequence, true);
-    this.pingStartedAt.set(`${session.sessionId}:${sequence}`, monotonicNow());
-    await session.send({
+    return {
       protocolVersion: MULTI_AGENT_PROTOCOL_VERSION,
       messageKind: MultiAgentMessageKind.PING,
       flags: 0,
@@ -244,7 +315,59 @@ export class RobotFleetManager {
       topicId: 0,
       ttlMilliseconds: 2000,
       applicationPayload: payload,
-    });
+    };
+  }
+
+  private finishPingTest(key: string, status: PingTestResult["status"], rttMs?: number, detail?: string): void {
+    const pending = this.pendingPingTests.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    pending.removeAbortListener?.();
+    this.pendingPingTests.delete(key);
+    this.pingStartedAt.delete(key);
+    const diagnostics = pending.result.diagnostics ? { ...pending.result.diagnostics } : undefined;
+    if (diagnostics) {
+      const sessionId = key.slice(0, key.lastIndexOf(":"));
+      diagnostics.automaticPingsSkipped = this.automaticPingSkips.get(sessionId) ?? 0;
+    }
+    const replyBeforeWriteCompleted = status === "received" && diagnostics?.writeFinishedAt === undefined;
+    const afterWriteMs = status === "received" && diagnostics?.writeFinishedAt !== undefined
+      ? Math.max(0, monotonicNow() - diagnostics.writeFinishedAt) : undefined;
+    pending.resolve({ ...pending.result, status, rttMs, detail, diagnostics, afterWriteMs, replyBeforeWriteCompleted });
+  }
+
+  private cancelPingTests(sessionId: string): void {
+    for (const key of this.pendingPingTests.keys()) {
+      if (key.startsWith(`${sessionId}:`)) this.finishPingTest(key, "error", undefined, "Robot session stopped during the test.");
+    }
+    this.clearAutomaticPing(sessionId);
+    this.automaticPingSkips.delete(sessionId);
+  }
+
+  private clearAutomaticPing(sessionId: string): void {
+    const pending = this.automaticPings.get(sessionId);
+    if (pending) this.pingStartedAt.delete(pending.key);
+    this.automaticPings.delete(sessionId);
+  }
+
+  private async sendAutomaticPing(session: RobotSession): Promise<void> {
+    if (session.state !== "ready" || session.robotId === undefined || this.automaticPingPauses.has(session.sessionId)) return;
+    const pending = this.automaticPings.get(session.sessionId);
+    if (pending && monotonicNow() >= pending.expiresAt) this.clearAutomaticPing(session.sessionId);
+    if (session.hasPendingWrites || this.automaticPings.has(session.sessionId)) {
+      this.automaticPingSkips.set(session.sessionId, (this.automaticPingSkips.get(session.sessionId) ?? 0) + 1);
+      return;
+    }
+    const sequence = session.nextSequence();
+    const key = `${session.sessionId}:${sequence}`;
+    const startedAt = monotonicNow();
+    this.pingStartedAt.set(key, startedAt);
+    this.automaticPings.set(session.sessionId, { key, expiresAt: startedAt + 2000 });
+    try {
+      await session.send(this.createPingMessage(session.robotId, sequence));
+    } catch {
+      if (this.automaticPings.get(session.sessionId)?.key === key) this.clearAutomaticPing(session.sessionId);
+    }
   }
 
   setActiveLegacyRobot(robotId: number | null): void {
@@ -297,6 +420,8 @@ export class RobotFleetManager {
         alias: session.alias,
         deviceName: session.transport.deviceName,
         browserIdentity: session.transport.browserIdentity,
+        runtimeChannel: session.transport.runtimeChannel,
+        runtimeUartWithoutResponseSupported: session.transport.supportsRuntimeUartWithoutResponse,
         state: session.state,
         health: session.getHealth(),
         capabilities: session.capabilities,
@@ -421,11 +546,13 @@ export class RobotFleetManager {
         ? new DataView(message.applicationPayload.buffer, message.applicationPayload.byteOffset).getUint16(0, true)
         : message.sequence;
       const key = `${session.sessionId}:${pingSequence}`;
+      if (this.automaticPings.get(session.sessionId)?.key === key) this.automaticPings.delete(session.sessionId);
       const startedAt = this.pingStartedAt.get(key);
       if (startedAt !== undefined) {
         const rtt = monotonicNow() - startedAt;
         this.pingStartedAt.delete(key);
         this.rttTrackers.get(session.sessionId)?.add(rtt, session.metrics);
+        this.finishPingTest(key, "received", rtt);
         this.logMessage(message, "pong", rtt);
       }
       return;
@@ -520,8 +647,10 @@ export class RobotFleetManager {
           ttlMilliseconds: 3000,
           applicationPayload: new Uint8Array(0),
         };
-        void session.send(message).catch(() => undefined);
-        void this.ping(session.robotId!).catch(() => undefined);
+        const sendProbe = !this.automaticPingPauses.has(session.sessionId);
+        void session.send(message).then(() => {
+          if (sendProbe) return this.sendAutomaticPing(session);
+        }).catch(() => undefined);
       }
       this.notify();
     }, HEARTBEAT_INTERVAL_MS);

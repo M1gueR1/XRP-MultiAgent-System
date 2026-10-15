@@ -75,6 +75,7 @@ import powerswitch_standard from '@assets/images/XRP-nonbeta-controller-power.jp
 import powerswitch_beta from '@assets/images/XRP_Controller-Power.jpg';
 import xrpRunSelector from '@assets/images/xrp-run-selector.png';
 import BusyDialog from '@components/dialogs/busydlg';
+import BluetoothConnectionGameDialog from '@components/dialogs/BluetoothConnectionGameDialog';
 import { UAParser } from 'ua-parser-js';
 import backup_restore from '@assets/images/backup_restore.svg';
 import BackupRestoreDlg from '@components/dialogs/backup-restoredlg';
@@ -366,16 +367,6 @@ function NavBar({ layoutref }: NavBarProps) {
                 } else if (status === LoginStatus.LOGGED_OUT) {
                     setLogin(false);
                 }
-            });
-
-            AppMgr.getInstance().on(EventType.EVENT_SHOWBLUETOOTH_CONNECTING, () => {
-                setDialogContent(<BusyDialog title={t('connecting-bluetooth')} />);
-                openDialog();
-            });
-
-            AppMgr.getInstance().on(EventType.EVENT_HIDE_BLUETOOTH_CONNECTING, () => {
-                setDialogContent(<div />);
-                closeDialog();
             });
 
             hasSubscribed = true;
@@ -2059,6 +2050,7 @@ function NavBar({ layoutref }: NavBarProps) {
             <Dialog isOpen={isDlgOpen} toggleDialog={toggleDialog} ref={dialogRef}>
                 {dialogContent}
             </Dialog>
+            <BluetoothConnectionGameDialog />
         </div>
     );
 }

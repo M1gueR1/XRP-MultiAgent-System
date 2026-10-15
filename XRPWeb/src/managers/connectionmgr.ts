@@ -3,6 +3,7 @@ import { ConnectionCMD, ConnectionType } from '@/utils/types';
 import Connection, { ConnectionState } from '@/connections/connection';
 import { USBConnection } from '@/connections/usbconnection';
 import { BluetoothConnection } from '@/connections/bluetoothconnection';
+import { createBootSafetyClient } from '@/components/dashboard/bootSafety/bootSafetyService';
 import type {
     USBRobotFleetSnapshot,
     USBRobotSessionSnapshot,
@@ -34,6 +35,9 @@ type TeamTransportMode = 'usb' | 'bluetooth' | 'bluetooth_uart';
 
 type RobotTerminalListener = (data: string) => void;
 
+const BLUETOOTH_PRELOAD_MARKER_PATH = '/lib/MultiAgentLib/.bluetooth_preloaded';
+const BLUETOOTH_PRELOAD_MARKER_CONTENT = 'XRP_MULTI_AGENT_BLUETOOTH_PRELOADED_V1\n';
+
 interface USBRobotSessionRecord {
     sessionId: string;
     alias: string;
@@ -52,6 +56,7 @@ interface USBRobotSessionRecord {
     multiAgentLibraryInstalled: boolean;
     teamTransportConfigured: boolean;
     teamTransportMode?: TeamTransportMode;
+    bluetoothContextPreloaded: boolean;
 }
 
 interface BLERobotSessionRecord {
@@ -73,6 +78,7 @@ interface BLERobotSessionRecord {
     multiAgentLibraryInstalled: boolean;
     teamTransportConfigured: boolean;
     teamTransportMode?: TeamTransportMode;
+    bluetoothContextPreloaded: boolean;
     initializationPromise?: Promise<void>;
 }
 
@@ -115,14 +121,15 @@ export default class ConnectionMgr {
     private activeBLESessionId: string | null = null;
     private bleSessionSequence = 0;
     private switchingBLESession = false;
+    private bleInitializationQueue: Promise<void> = Promise.resolve();
     private terminalListeners = new Map<string, Set<RobotTerminalListener>>();
     private xrpID: string | undefined = undefined;
 
     constructor(appMgr: AppMgr) {
         this.appMgr = appMgr;
 
-        // Preserve the original auto-connect behavior for the first USB robot.
-        this.connections[ConnectionType.USB] = new USBConnection(this);
+        // Keep authorized USB ports closed until the user explicitly chooses USB.
+        this.connections[ConnectionType.USB] = new USBConnection(this, { manualOnly: true });
         this.cmdToXRPMgr.setConnection(this.connections[ConnectionType.USB]);
         this.activeConnection = this.connections[ConnectionType.USB];
         this.connections[ConnectionType.BLUETOOTH] = new BluetoothConnection(this);
@@ -139,7 +146,14 @@ export default class ConnectionMgr {
         });
     }
 
-    public async addUSBRobot(): Promise<void> {
+    public requestUSBRobotPort(): Promise<SerialPort> {
+        if (!('serial' in navigator)) {
+            return Promise.reject(new Error('Web Serial is not available in this browser.'));
+        }
+        return USBConnection.requestRobotPort();
+    }
+
+    public async addUSBRobot(selectedPort?: SerialPort): Promise<void> {
         if (!('serial' in navigator)) {
             throw new Error('Web Serial is not available. Use Chrome or Edge on localhost or HTTPS.');
         }
@@ -149,7 +163,7 @@ export default class ConnectionMgr {
 
         const connection = new USBConnection(this, { manualOnly: true });
         try {
-            await connection.connect();
+            await connection.connect(selectedPort);
             if (!connection.isConnected()) {
                 throw new Error('No USB XRP was selected.');
             }
@@ -249,6 +263,7 @@ export default class ConnectionMgr {
             active: record.sessionId === this.activeUSBSessionId,
             usbVendorId: record.usbVendorId,
             usbProductId: record.usbProductId,
+            bluetoothContextPreloaded: record.bluetoothContextPreloaded,
             programFiles: this.getProgramFilesForRecord(record),
             lastRunStartedAt: record.lastRunStartedAt,
             lastRunFinishedAt: record.lastRunFinishedAt,
@@ -285,6 +300,16 @@ export default class ConnectionMgr {
             // Nordic UART channel. Dedicated-DATA firmware will replace this tiny
             // config file on its first Bluetooth run while reusing the full bundle.
             await this.prepareTeamLibraryForRecord(record, 'bluetooth_uart');
+            await record.commands.uploadFile(
+                BLUETOOTH_PRELOAD_MARKER_PATH,
+                BLUETOOTH_PRELOAD_MARKER_CONTENT,
+                false,
+            );
+            await record.commands.verifyUploadedFiles([{
+                path: BLUETOOTH_PRELOAD_MARKER_PATH,
+                byteLength: new TextEncoder().encode(BLUETOOTH_PRELOAD_MARKER_CONTENT).length,
+            }]);
+            record.bluetoothContextPreloaded = true;
         } catch (error) {
             const detail = error instanceof Error ? error.message : String(error);
             const message = `${record.alias} Bluetooth preparation failed: ${detail}`;
@@ -314,9 +339,10 @@ export default class ConnectionMgr {
             await connection.connect();
             if (!connection.isConnected()) throw new Error('No Bluetooth XRP was selected.');
         } catch (error) {
-            const record = this.findBLESession(connection);
-            if (record && !connection.isConnected()) {
-                this.bleSessions.delete(record.sessionId);
+            if (connection.getDevice()) {
+                const record = this.ensureBLESession(connection);
+                record.state = 'error';
+                record.error = error instanceof Error ? error.message : String(error);
                 this.emitBLEFleet();
             }
             throw error;
@@ -352,12 +378,147 @@ export default class ConnectionMgr {
         record.state = 'connecting';
         record.error = undefined;
         this.emitBLEFleet();
-        if (record.connection.isConnected()) {
-            await this.initializeBLESession(record);
-        } else {
-            await record.connection.reconnect();
+        try {
+            await record.connection.reconnect(true);
+            if (this.requireBLESession(sessionId).state !== 'connected') {
+                throw new Error(`The IDE did not finish initializing ${record.alias}.`);
+            }
+        } catch (error) {
+            record.state = 'error';
+            record.error = error instanceof Error ? error.message : String(error);
+            this.emitBLEFleet();
+            throw error;
         }
-        if (!record.connection.isConnected()) throw new Error(`Could not reconnect ${record.alias}.`);
+    }
+
+    public async reconnectBluetoothRobotWithChooser(sessionId: string): Promise<void> {
+        const record = this.requireBLESession(sessionId);
+        record.state = 'connecting';
+        record.error = undefined;
+        record.initialized = false;
+        this.emitBLEFleet();
+        try {
+            await record.connection.reconnectWithDeviceChooser();
+            if (this.requireBLESession(sessionId).state !== 'connected') {
+                throw new Error(`The IDE did not finish initializing ${record.alias}.`);
+            }
+        } catch (error) {
+            record.state = 'error';
+            record.error = error instanceof Error ? error.message : String(error);
+            this.emitBLEFleet();
+            throw error;
+        }
+    }
+
+    public async retryBluetoothRobot(sessionId: string): Promise<void> {
+        const record = this.requireBLESession(sessionId);
+        await record.connection.disconnect();
+        if (record.initializationPromise) {
+            await this.waitForBLEInitialization(record);
+        }
+        record.initialized = false;
+        await this.reconnectBluetoothRobot(sessionId);
+    }
+
+    public async repairBluetoothRobotOverUSB(
+        sessionId: string,
+        port: SerialPort,
+        onProgress: (percent: number, message: string) => void = () => undefined,
+    ): Promise<string | undefined> {
+        const bluetooth = this.requireBLESession(sessionId);
+        const advertisedSuffix = bluetooth.deviceName?.match(/^XRP-([0-9a-f]{5})$/i)?.[1].toLowerCase();
+        if (!advertisedSuffix) {
+            throw new Error('Cannot verify this Bluetooth XRP against a USB port. No robot files were changed.');
+        }
+
+        if (bluetooth.connection.isConnected()) await bluetooth.connection.disconnect();
+        if (bluetooth.initializationPromise) await this.waitForBLEInitialization(bluetooth);
+
+        onProgress(20, 'Opening the USB connection...');
+        let usb = [...this.usbSessions.values()].find((record) => record.connection.getPortHandle() === port);
+        if (usb && !usb.connection.isConnected()) await usb.connection.reconnect();
+        if (!usb) {
+            await this.addUSBRobot(port);
+            usb = [...this.usbSessions.values()].find((record) => record.connection.getPortHandle() === port);
+        }
+        if (!usb?.connection.isConnected() || usb.state !== 'connected') {
+            throw new Error('The selected USB XRP did not finish initializing. No robot files were changed.');
+        }
+        if (usb.runtimeState !== 'idle' || usb.commands.BUSY) {
+            throw new Error('The selected USB XRP is busy. Stop its program before repairing Bluetooth.');
+        }
+
+        onProgress(35, 'Verifying the XRP identity...');
+        const identityOutput = await usb.commands.executeRawUtility(
+            "import machine\nprint('XRP_REPAIR_ID=' + ''.join('{:02x}'.format(byte) for byte in machine.unique_id()))\nprint('XRP_REPAIR_ID_DONE')",
+            'XRP_REPAIR_ID_DONE',
+        );
+        const usbIdentity = identityOutput.join('\n').match(/XRP_REPAIR_ID=([0-9a-f]+)/i)?.[1].toLowerCase();
+        if (!usbIdentity || !usbIdentity.endsWith(advertisedSuffix)) {
+            throw new Error(`The selected USB port is not ${bluetooth.deviceName}. No robot files were changed.`);
+        }
+
+        onProgress(50, 'Running a clean program on the XRP...');
+        await usb.commands.prepareForRun();
+        const cleanupPath = `/__xrp_ble_repair_${Date.now().toString(36)}.py`;
+        await usb.commands.uploadFile(cleanupPath, 'print("A")\n', false);
+        try {
+            const output = await usb.commands.executeRawUtility(
+                `exec(open(${JSON.stringify(cleanupPath)}).read())\nprint('XRP_REPAIR_PROGRAM_DONE')`,
+                'XRP_REPAIR_PROGRAM_DONE',
+            );
+            if (!output.some((line) => line.includes('XRP_REPAIR_PROGRAM_DONE'))) {
+                throw new Error('The cleanup program did not finish. Boot files were not changed.');
+            }
+        } finally {
+            await usb.commands.executeRawUtility(
+                `import os\nos.remove(${JSON.stringify(cleanupPath)})\nprint('XRP_REPAIR_CLEANUP_DONE')`,
+                'XRP_REPAIR_CLEANUP_DONE',
+            );
+        }
+
+        onProgress(70, 'Backing up main.py and disabling autorun safely...');
+        const bootSafety = createBootSafetyClient(
+            async (script) => (await usb.commands.executeRawUtility(script, 'BOOT_SAFETY:SCRIPT_DONE')).join('\r\n'),
+            () => usb.connection.isConnected(),
+        );
+        const report = await bootSafety.disableAutorun();
+        const backupPath = report.backupPath;
+        let resetError: unknown;
+        try {
+            onProgress(85, 'Resetting the XRP and closing the USB session...');
+            try {
+                await usb.connection.writeToDevice('import machine; machine.reset()\r');
+            } catch (error) {
+                resetError = error;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            await usb.connection.disconnect();
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+            bluetooth.initialized = false;
+            onProgress(100, 'Connection restored. Ready to select the XRP over Bluetooth.');
+            return backupPath;
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const resetDetail = resetError instanceof Error ? ` Automatic reset may have failed: ${resetError.message}.` : '';
+            throw new Error(`Safe boot was written${backupPath ? ` (backup: ${backupPath})` : ''}, but USB cleanup failed: ${detail}.${resetDetail}`);
+        }
+    }
+
+    private async waitForBLEInitialization(record: BLERobotSessionRecord): Promise<void> {
+        const initialization = record.initializationPromise;
+        if (!initialization) return;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await Promise.race([
+                initialization.catch(() => undefined),
+                new Promise<never>((_, reject) => {
+                    timeout = setTimeout(() => reject(new Error('The previous Bluetooth initialization is still stopping. Try again shortly.')), 10000);
+                }),
+            ]);
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
     }
 
     public async disconnectBluetoothRobot(sessionId: string): Promise<void> {
@@ -366,7 +527,9 @@ export default class ConnectionMgr {
 
     public async removeBluetoothRobot(sessionId: string): Promise<void> {
         const record = this.requireBLESession(sessionId);
-        if (record.connection.isConnected()) await record.connection.disconnect();
+        if (record.connection.isConnected() || record.connection.getDevice()?.gatt?.connected) {
+            await record.connection.disconnect();
+        }
         this.bleSessions.delete(sessionId);
         await getRobotFleetManager().removeExternalRobot(this.runtimeExternalKey('bluetooth', sessionId));
         if (this.activeBLESessionId === sessionId) this.activeBLESessionId = null;
@@ -383,7 +546,9 @@ export default class ConnectionMgr {
     }
 
     public async disconnectAllBluetooth(): Promise<void> {
-        const connected = [...this.bleSessions.values()].filter((record) => record.connection.isConnected());
+        const connected = [...this.bleSessions.values()].filter((record) =>
+            record.connection.isConnected() || record.connection.getDevice()?.gatt?.connected,
+        );
         for (const record of connected) await record.connection.disconnect();
     }
 
@@ -396,6 +561,7 @@ export default class ConnectionMgr {
             active: record.sessionId === this.activeBLESessionId,
             deviceName: record.deviceName,
             browserDeviceId: record.browserDeviceId,
+            bluetoothContextPreloaded: record.bluetoothContextPreloaded,
             programFiles: this.getProgramFilesForRecord(record),
             lastRunStartedAt: record.lastRunStartedAt,
             lastRunFinishedAt: record.lastRunFinishedAt,
@@ -989,7 +1155,10 @@ export default class ConnectionMgr {
             await record.initializationPromise;
             return;
         }
-        const initialization = this.performBLESessionInitialization(record);
+        const initialization = this.bleInitializationQueue
+            .catch(() => undefined)
+            .then(() => this.performBLESessionInitialization(record));
+        this.bleInitializationQueue = initialization.catch(() => undefined);
         record.initializationPromise = initialization;
         try {
             await initialization;
@@ -1016,6 +1185,7 @@ export default class ConnectionMgr {
             this.appMgr.emit(EventType.EVENT_CONNECTION_STATUS, ConnectionState.Connected.toString());
             phase = 'reading the XRP filesystem';
             await this.refreshFilesystemForRecord(record);
+            this.updateBluetoothPreloadState(record);
             phase = 'restoring the normal MicroPython prompt';
             await record.connection.getToNormal();
             phase = 'clearing the previous run state';
@@ -1076,6 +1246,7 @@ export default class ConnectionMgr {
             commands: this.createSessionCommandManager(connection),
             multiAgentLibraryInstalled: false,
             teamTransportConfigured: false,
+            bluetoothContextPreloaded: false,
         };
         this.bleSessions.set(record.sessionId, record);
         return record;
@@ -1110,6 +1281,7 @@ export default class ConnectionMgr {
             }
             this.appMgr.emit(EventType.EVENT_CONNECTION_STATUS, ConnectionState.Connected.toString());
             await this.refreshFilesystemForRecord(record);
+            this.updateBluetoothPreloadState(record);
             await record.connection.getToNormal();
             await this.cmdToXRPMgr.resetTerminal();
             await this.cmdToXRPMgr.clearIsRunning();
@@ -1162,6 +1334,7 @@ export default class ConnectionMgr {
             commands: this.createSessionCommandManager(connection),
             multiAgentLibraryInstalled: false,
             teamTransportConfigured: false,
+            bluetoothContextPreloaded: false,
         };
         this.usbSessions.set(record.sessionId, record);
         return record;
@@ -1218,6 +1391,30 @@ export default class ConnectionMgr {
     private emitCachedFilesystem(record: IDERobotSessionRecord): void {
         if (record.filesystemCache) {
             this.appMgr.emit(EventType.EVENT_FILESYS, record.filesystemCache);
+        }
+    }
+
+    private updateBluetoothPreloadState(record: IDERobotSessionRecord): void {
+        record.bluetoothContextPreloaded = this.filesystemContainsFile(
+            record,
+            BLUETOOTH_PRELOAD_MARKER_PATH,
+        );
+    }
+
+    private filesystemContainsFile(record: IDERobotSessionRecord, targetPath: string): boolean {
+        if (!record.filesystemCache) return false;
+        try {
+            const roots = JSON.parse(record.filesystemCache) as RobotFilesystemNode[];
+            const visit = (node: RobotFilesystemNode): boolean => {
+                if (node.children === null) {
+                    const filePath = node.path === '/' ? `/${node.name}` : `${node.path}/${node.name}`;
+                    return filePath === targetPath;
+                }
+                return (node.children ?? []).some(visit);
+            };
+            return roots.some(visit);
+        } catch {
+            return false;
         }
     }
 

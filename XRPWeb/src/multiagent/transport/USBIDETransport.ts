@@ -3,6 +3,7 @@ import type { RobotTransport } from './RobotTransport';
 
 /** Reuses an already-open Web Serial IDE connection without owning its lifecycle. */
 export class USBIDETransport implements RobotTransport {
+  readonly runtimeChannel = 'usb' as const;
   private attached = false;
 
   constructor(private readonly connection: USBConnection) {}

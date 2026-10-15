@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { FaProjectDiagram, FaTrash } from "react-icons/fa";
 import {
-  BROADCAST_ROBOT_ID,
   getRobotFleetManager,
   MultiAgentTopic,
   encodeEmotionState,
@@ -14,12 +14,22 @@ import type { IDERobotRuntimeState, PreferredRobotProgramRequest } from "@/conne
 import { useGridStackWidget } from "../hooks/useGridStackWidget";
 import { useGridStackContext } from "../lib";
 import SensorCard from "./SensorCard";
+import TeamMessageLog from "./TeamMessageLog";
 
 const fleet = getRobotFleetManager();
 const appMgr = AppMgr.getInstance();
 const INITIAL_STATUS = "Ready. Add each cable-connected XRP, then choose which robot owns the IDE files.";
 const PREFERRED_PROGRAMS_STORAGE_KEY = "xrp-multiagent-preferred-programs-v1";
 const PREFERRED_FOLDERS_STORAGE_KEY = "xrp-multiagent-preferred-folders-v1";
+
+type BLERepairDialog = {
+  sessionId: string;
+  alias: string;
+  stage: "disconnecting" | "ready" | "working" | "complete" | "error";
+  progress: number;
+  message: string;
+  backupPath?: string;
+};
 
 function readPreferredPrograms(): Record<string, string> {
   if (typeof localStorage === "undefined") return {};
@@ -104,12 +114,14 @@ export default function MultiAgentLabWidget() {
   const [usbSnapshot, setUsbSnapshot] = useState<USBRobotFleetSnapshot>(() => appMgr.getUSBFleetSnapshot());
   const [bleIDESnapshot, setBleIDESnapshot] = useState<BLERobotFleetSnapshot>(() => appMgr.getBluetoothIDEFleetSnapshot());
   const [status, setStatus] = useState(INITIAL_STATUS);
-  const [target, setTarget] = useState(String(BROADCAST_ROBOT_ID));
-  const [showMessageTester, setShowMessageTester] = useState(false);
   const [preparingBluetoothSessionId, setPreparingBluetoothSessionId] = useState<string | null>(null);
   const [preferredPrograms, setPreferredPrograms] = useState<Record<string, string>>(() => readPreferredPrograms());
   const [preferredFolders, setPreferredFolders] = useState<Record<string, string>>(() => readPreferredFolders());
   const [runChoiceEnabled, setRunChoiceEnabled] = useState(() => appMgr.isMultiRobotRunChoiceEnabled());
+  const [repairingBLESessionId, setRepairingBLESessionId] = useState<string | null>(null);
+  const [bleRepairDialog, setBLERepairDialog] = useState<BLERepairDialog | null>(null);
+  const [bluetoothReadyAfterRepair, setBluetoothReadyAfterRepair] = useState<Record<string, boolean>>({});
+  const [stalledBLESessions, setStalledBLESessions] = useState<string[]>([]);
   const currentDashboardEmotion = useRef<{ emotionId: number; generation: number } | null>(null);
   const deliveredEmotionGeneration = useRef(new Map<number, number>());
   const connectedIDERobots = [
@@ -126,6 +138,20 @@ export default function MultiAgentLabWidget() {
       programFiles: session.programFiles,
     })),
   ];
+  const pendingBLEKey = bleIDESnapshot.sessions
+    .filter((session) => session.state === "connecting" || session.state === "reconnecting" || session.state === "initializing")
+    .map((session) => `${session.sessionId}:${session.state}`)
+    .join("|");
+
+  useEffect(() => {
+    const pendingIds = pendingBLEKey.split("|").filter(Boolean).map((entry) => entry.split(":")[0]);
+    setStalledBLESessions((current) => current.filter((id) => pendingIds.includes(id)));
+    if (pendingIds.length === 0) return;
+    const timeout = window.setTimeout(() => {
+      setStalledBLESessions((current) => [...new Set([...current, ...pendingIds])]);
+    }, 30000);
+    return () => window.clearTimeout(timeout);
+  }, [pendingBLEKey]);
 
   useEffect(() => {
     const unsubscribeFleet = fleet.subscribe(setSnapshot);
@@ -219,6 +245,67 @@ export default function MultiAgentLabWidget() {
     }
   };
 
+  const openBLERepair = async (sessionId: string, alias: string) => {
+    setRepairingBLESessionId(sessionId);
+    setBLERepairDialog({ sessionId, alias, stage: "disconnecting", progress: 5, message: "Disconnecting Bluetooth..." });
+    try {
+      await appMgr.disconnectBluetoothIDERobot(sessionId);
+      setBLERepairDialog((current) => current?.sessionId === sessionId
+        ? { ...current, stage: "ready", progress: 10, message: "Connect this XRP by USB, then grant USB access." }
+        : current);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setBLERepairDialog((current) => current?.sessionId === sessionId
+        ? { ...current, stage: "error", message: `Could not disconnect Bluetooth: ${detail}` }
+        : current);
+      setRepairingBLESessionId(null);
+    }
+  };
+
+  const repairBLEOverUSB = (sessionId: string) => {
+    setBLERepairDialog((current) => current?.sessionId === sessionId
+      ? { ...current, stage: "working", progress: 15, message: "Waiting for USB access..." }
+      : current);
+    const portPromise = appMgr.requestUSBRobotPort();
+    void (async () => {
+      try {
+        const port = await portPromise;
+        const backupPath = await appMgr.repairBluetoothIDERobotOverUSB(sessionId, port, (progress, message) => {
+          setBLERepairDialog((current) => current?.sessionId === sessionId
+            ? { ...current, progress, message }
+            : current);
+        });
+        setBluetoothReadyAfterRepair((current) => ({ ...current, [sessionId]: true }));
+        setBLERepairDialog((current) => current?.sessionId === sessionId
+          ? { ...current, stage: "complete", progress: 100, message: "Connection restored", backupPath }
+          : current);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError") {
+          setBLERepairDialog((current) => current?.sessionId === sessionId
+            ? { ...current, stage: "ready", progress: 10, message: "USB selection was canceled. Select this XRP to continue." }
+            : current);
+          return;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        setBLERepairDialog((current) => current?.sessionId === sessionId
+          ? { ...current, stage: "error", message: detail }
+          : current);
+      }
+    })();
+  };
+
+  const connectRepairedBluetooth = (sessionId: string, alias: string) => {
+    setBLERepairDialog(null);
+    setRepairingBLESessionId(null);
+    setStatus(`Select ${alias} in the Bluetooth device chooser...`);
+    void appMgr.reconnectBluetoothIDERobotWithChooser(sessionId).then(() => {
+      setBluetoothReadyAfterRepair((current) => ({ ...current, [sessionId]: false }));
+      setStatus(`${alias} connected over Bluetooth.`);
+    }).catch((error: unknown) => {
+      setStatus(error instanceof Error ? error.message : String(error));
+    });
+  };
+
   const openRobotTerminal = (sessionId: string, alias: string) => {
     const alreadyOpen = [..._rawWidgetMetaMap.value.values()].some((meta) => {
       if (!meta.content) return false;
@@ -264,39 +351,6 @@ export default function MultiAgentLabWidget() {
     } finally {
       setPreparingBluetoothSessionId(null);
     }
-  };
-
-  const sendTestMessage = async () => {
-    const targetId = Number(target);
-    try {
-      if (targetId === BROADCAST_ROBOT_ID) {
-        const readyRobotIds = snapshot.sessions
-          .filter((session) => session.state === "ready" && session.robotId !== undefined)
-          .map((session) => session.robotId!);
-        if (readyRobotIds.length === 0) throw new Error("No ready robots are available for a test message.");
-        await Promise.all(readyRobotIds.map((robotId) => fleet.ping(robotId)));
-        setStatus(`Test message sent to ${readyRobotIds.length} robot${readyRobotIds.length === 1 ? "" : "s"}.`);
-      } else {
-        await fleet.ping(targetId);
-        setStatus(`Test message sent to robot ${targetId}.`);
-      }
-      setShowMessageTester(false);
-    } catch (error) {
-      setStatus(error instanceof Error ? error.message : String(error));
-    }
-  };
-
-  const openMessageTester = () => {
-    const targetStillExists = target === String(BROADCAST_ROBOT_ID)
-      || snapshot.sessions.some((session) => session.robotId !== undefined && String(session.robotId) === target);
-    if (!targetStillExists) setTarget(String(BROADCAST_ROBOT_ID));
-    setShowMessageTester(true);
-  };
-
-  const closeMessageTester = () => setShowMessageTester(false);
-
-  const handleMessageTesterBackdrop = (event: MouseEvent<HTMLDivElement>) => {
-    if (event.target === event.currentTarget) closeMessageTester();
   };
 
   const updatePreferredProgram = (sessionId: string, path: string) => {
@@ -375,26 +429,6 @@ export default function MultiAgentLabWidget() {
     const selected = preferredPrograms[robot.sessionId];
     return Boolean(selected) && robot.programFiles.includes(selected) && robot.runtimeState === "idle";
   });
-
-  const messageTargetOptions = snapshot.sessions
-    .filter((session) => session.robotId !== undefined)
-    .map((session) => (
-      <option key={session.sessionId} value={String(session.robotId)}>
-        {session.alias} ({session.robotId})
-      </option>
-    ));
-
-  const readyMessageTargets = snapshot.sessions.some((session) => session.state === "ready" && session.robotId !== undefined);
-  const routingRows = snapshot.routingLog.map((entry) => (
-    <div key={entry.id} className="grid grid-cols-[5rem_3rem_1rem_3rem_4rem_1fr] gap-1 border-t border-gray-800 py-1">
-      <span>{new Date(entry.time).toLocaleTimeString()}</span>
-      <span>{entry.sourceRobotId}</span>
-      <span>-&gt;</span>
-      <span>{entry.targetRobotId}</span>
-      <span>0x{entry.topicId.toString(16).padStart(4, "0")}</span>
-      <span>{entry.status}{entry.rttMs !== undefined ? ` ${entry.rttMs.toFixed(1)}ms` : ""}</span>
-    </div>
-  ));
 
   const content = (
     <section className="flex h-full w-full flex-col gap-3 overflow-auto rounded-xl bg-black p-3 pt-1 text-xs text-white">
@@ -522,7 +556,7 @@ export default function MultiAgentLabWidget() {
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
                 {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectUSBRobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
                 {session.state === "connected" && <button className="rounded-lg border border-emerald-300 px-2 py-1 text-emerald-100 transition hover:bg-emerald-500 hover:text-black" onClick={() => openRobotTerminal(session.sessionId, session.alias)}>Open terminal</button>}
-                {session.state === "connected" && <button className="rounded-lg border border-cyan-300 px-2 py-1 text-cyan-100 transition hover:bg-cyan-500 hover:text-black disabled:cursor-not-allowed disabled:opacity-50" disabled={session.runtimeState !== "idle" || preparingBluetoothSessionId !== null} onClick={() => void prepareUSBForBluetooth(session.sessionId, session.alias)}>{preparingBluetoothSessionId === session.sessionId ? "Preparing..." : "Prepare for Bluetooth"}</button>}
+                {session.state === "connected" && <button className={`rounded-lg border px-2 py-1 transition disabled:cursor-not-allowed disabled:opacity-50 ${session.bluetoothContextPreloaded ? "border-green-300 bg-green-500 text-black hover:bg-green-400" : "border-cyan-300 text-cyan-100 hover:bg-cyan-500 hover:text-black"}`} disabled={session.runtimeState !== "idle" || preparingBluetoothSessionId !== null} onClick={() => void prepareUSBForBluetooth(session.sessionId, session.alias)}>{preparingBluetoothSessionId === session.sessionId ? "Preparing..." : session.bluetoothContextPreloaded ? "Prepared for Bluetooth" : "Prepare for Bluetooth"}</button>}
                 {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectUSBRobot(session.sessionId), `${session.alias} reconnected.`)}>Reconnect</button>}
                 {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectUSBRobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
                 <button className="rounded-lg border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameUSBRobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
@@ -553,10 +587,13 @@ export default function MultiAgentLabWidget() {
                 <dt>BLE device</dt><dd className="truncate">{session.deviceName ?? "XRP"}</dd>
                 <dt>Browser ID</dt><dd className="truncate">{session.browserDeviceId ?? "unknown"}</dd>
               </dl>
+              {session.bluetoothContextPreloaded && <p className="mt-2 text-xs font-semibold text-green-400">Context preloaded</p>}
               {session.error && <p className="mt-2 text-xs text-red-300">{session.error}</p>}
               <div className="mt-2 flex flex-wrap gap-1 text-xs">
                 {session.state === "connected" && <button className="rounded-lg border px-2 py-1 disabled:opacity-50" disabled={session.active} onClick={() => void run(() => appMgr.selectBluetoothIDERobot(session.sessionId), `${session.alias} now owns the IDE files, terminal, save, and run controls.`)}>{session.active ? "IDE files active" : "Open this XRP in IDE"}</button>}
-                {(session.state === "disconnected" || session.state === "error") && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.reconnectBluetoothIDERobot(session.sessionId), `${session.alias} reconnected over Bluetooth.`)}>Reconnect</button>}
+                {session.state === "connected" && <button className="rounded-lg border border-emerald-300 px-2 py-1 text-emerald-100 transition hover:bg-emerald-500 hover:text-black" onClick={() => openRobotTerminal(session.sessionId, session.alias)}>Open terminal</button>}
+                {(session.state === "disconnected" || session.state === "error" || stalledBLESessions.includes(session.sessionId)) && !bluetoothReadyAfterRepair[session.sessionId] && <button className="rounded-lg border border-cyan-300 px-2 py-1 text-cyan-100 disabled:opacity-50" disabled={repairingBLESessionId !== null || !usbSnapshot.supported} onClick={() => void openBLERepair(session.sessionId, session.alias)}>{repairingBLESessionId === session.sessionId ? "Repairing..." : "Repair connection"}</button>}
+                {bluetoothReadyAfterRepair[session.sessionId] && session.state !== "connected" && <button className="rounded-lg border border-green-300 px-2 py-1 text-green-100" onClick={() => connectRepairedBluetooth(session.sessionId, session.alias)}>Connect by Bluetooth</button>}
                 {session.state !== "disconnected" && <button className="rounded-lg border px-2 py-1" onClick={() => void run(() => appMgr.disconnectBluetoothIDERobot(session.sessionId), `${session.alias} disconnected.`)}>Disconnect</button>}
                 <button className="rounded-lg border px-2 py-1" onClick={() => { const alias = window.prompt("Robot alias", session.alias); if (alias) { try { appMgr.renameBluetoothIDERobot(session.sessionId, alias); } catch (error) { setStatus(error instanceof Error ? error.message : String(error)); } } }}>Rename</button>
                 <button className="rounded-lg border border-red-400 px-2 py-1 text-red-300" onClick={() => void run(() => appMgr.removeBluetoothIDERobot(session.sessionId), `${session.alias} removed.`)}>Remove</button>
@@ -567,55 +604,24 @@ export default function MultiAgentLabWidget() {
         </div>
       </div>
 
-      {status !== INITIAL_STATUS && <p className="rounded-xl border border-zinc-700 bg-zinc-950 p-2 text-zinc-300">{status}</p>}
-
-      <div className="rounded-xl border border-yellow-300/80 bg-zinc-950 p-3">
-        <div className="mb-2 flex flex-wrap items-center gap-2">
-          <h3 className="mr-auto font-semibold text-yellow-100">Team Message Log</h3>
-          <button className="rounded-lg border border-yellow-300 bg-black px-3 py-1 text-xs font-bold text-yellow-100 transition hover:bg-yellow-300 hover:text-black" onClick={openMessageTester}>
-            Test message
-          </button>
-        </div>
-        <div className="max-h-48 overflow-auto font-mono text-xs">
-          {routingRows.length > 0 ? routingRows : <p className="py-2 font-sans text-gray-400">No messages routed yet.</p>}
-        </div>
-      </div>
-
-      {showMessageTester && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
-          role="presentation"
-          onMouseDown={handleMessageTesterBackdrop}
-        >
-          <div className="w-full max-w-md rounded border border-yellow-300 bg-black p-4 text-white shadow-[0_0_24px_rgba(250,204,21,0.18)]">
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-lg font-semibold">Send Test Message</h3>
-                <p className="mt-1 text-xs text-gray-300">Send a ping through the laptop router to check that the selected XRP is reachable.</p>
-              </div>
-              <button className="rounded border border-gray-500 px-2 py-1 text-xs" onClick={closeMessageTester}>Close</button>
-            </div>
-            <label className="block text-sm">
-              Target
-              <select
-                className="mt-1 block w-full rounded border border-white bg-black p-2"
-                value={target}
-                onChange={(event) => setTarget(event.target.value)}
-              >
-                <option value={String(BROADCAST_ROBOT_ID)}>Broadcast</option>
-                {messageTargetOptions}
-              </select>
-            </label>
-            <button
-              className="mt-4 w-full rounded bg-yellow-300 px-3 py-2 font-semibold text-black disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={!readyMessageTargets}
-              onClick={() => void sendTestMessage()}
-            >
-              Send message
-            </button>
+      {bleRepairDialog && createPortal(<div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/75 p-4" role="presentation">
+        <div role="dialog" aria-modal="true" aria-labelledby="ble-repair-title" className="w-full max-w-md rounded border border-cyan-300 bg-zinc-950 p-5 text-white shadow-2xl" onKeyDown={(event) => { if (event.key === "Escape" && (bleRepairDialog.stage === "ready" || bleRepairDialog.stage === "error")) { setBLERepairDialog(null); setRepairingBLESessionId(null); } }}>
+          <h3 id="ble-repair-title" className="text-base font-semibold">Repair Bluetooth connection</h3>
+          <p className="mt-3 text-sm text-zinc-200">Connection repair will access {bleRepairDialog.alias} over USB, run a clean program, and disable autorun safely. Select the same XRP in the USB port chooser. Its USB cable can stay connected for power.</p>
+          <p className={`mt-4 text-sm ${bleRepairDialog.stage === "error" ? "text-red-300" : bleRepairDialog.stage === "complete" ? "text-green-300" : "text-zinc-200"}`} role="status">{bleRepairDialog.message}</p>
+          <div className="mt-3 h-2 overflow-hidden rounded bg-zinc-700" role="progressbar" aria-valuenow={bleRepairDialog.progress} aria-valuemin={0} aria-valuemax={100} aria-label="Connection repair progress"><div className="h-full bg-cyan-400 transition-all duration-300" style={{ width: `${bleRepairDialog.progress}%` }} /></div>
+          {bleRepairDialog.backupPath && <p className="mt-3 break-all text-xs text-zinc-400">Previous /main.py backed up to {bleRepairDialog.backupPath}.</p>}
+          <div className="mt-5 flex justify-end gap-2 text-sm">
+            {(bleRepairDialog.stage === "ready" || bleRepairDialog.stage === "error") && <button type="button" className="rounded border border-zinc-500 px-3 py-2 text-zinc-100 hover:bg-zinc-800" onClick={() => { setBLERepairDialog(null); setRepairingBLESessionId(null); }}>Cancel</button>}
+            {bleRepairDialog.stage === "ready" && <button type="button" autoFocus className="rounded border border-cyan-300 bg-cyan-600 px-3 py-2 font-semibold text-white hover:bg-cyan-500" onClick={() => repairBLEOverUSB(bleRepairDialog.sessionId)}>Access USB</button>}
+            {bleRepairDialog.stage === "complete" && <button type="button" autoFocus className="rounded border border-green-300 bg-green-600 px-3 py-2 font-semibold text-white hover:bg-green-500" onClick={() => connectRepairedBluetooth(bleRepairDialog.sessionId, bleRepairDialog.alias)}>Exit</button>}
           </div>
         </div>
-      )}
+      </div>, document.body)}
+
+      {status !== INITIAL_STATUS && <p className="rounded-xl border border-zinc-700 bg-zinc-950 p-2 text-zinc-300">{status}</p>}
+
+      <TeamMessageLog snapshot={snapshot} fleet={fleet} />
     </section>
   );
 

@@ -1,10 +1,11 @@
-import type { RobotTransport } from "./RobotTransport";
+import type { RobotTransport, TransportWriteDiagnostics } from "./RobotTransport";
 
 const UART_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 const DATA_WRITER_UUID = "92ae6088-f24d-4360-b1b1-a432a8ed36ff";
 const DATA_READER_UUID = "92ae6088-f24d-4360-b1b1-a432a8ed36fe";
 
 export class WebBluetoothRuntimeTransport implements RobotTransport {
+  readonly runtimeChannel = "ble-data" as const;
   private server?: BluetoothRemoteGATTServer;
   private writer?: BluetoothRemoteGATTCharacteristic;
   private reader?: BluetoothRemoteGATTCharacteristic;
@@ -65,8 +66,11 @@ export class WebBluetoothRuntimeTransport implements RobotTransport {
     return this.device.gatt?.connected === true && this.writer !== undefined;
   }
 
-  async writeData(data: Uint8Array): Promise<void> {
+  async writeData(data: Uint8Array, diagnostics?: TransportWriteDiagnostics): Promise<void> {
     if (!this.writer || !this.isConnected()) throw new Error("Fleet BLE DATA writer is not connected.");
+    if (diagnostics) Object.assign(diagnostics, {
+      channel: this.runtimeChannel, encodedBytes: data.length, chunks: 1, attempts: 1, retries: 0,
+    });
     if (
       this.writer.properties.writeWithoutResponse &&
       typeof this.writer.writeValueWithoutResponse === "function"

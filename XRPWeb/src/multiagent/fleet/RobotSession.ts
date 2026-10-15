@@ -7,6 +7,7 @@ import type { RobotTransport } from "../transport/RobotTransport";
 import { createSessionMetrics } from "./metrics";
 import type {
   RobotHealth,
+  PingWriteDiagnostics,
   RobotSessionContract,
   RobotSessionMetrics,
   RobotSessionState,
@@ -107,13 +108,17 @@ export class RobotSession implements RobotSessionContract {
     return result;
   }
 
-  send(message: MultiAgentMessage): Promise<void> {
+  send(message: MultiAgentMessage, diagnostics?: PingWriteDiagnostics): Promise<void> {
     if (!this.transport.isConnected()) return Promise.reject(new Error("Robot session is not connected."));
-    return this.scheduler.enqueue(message);
+    return this.scheduler.enqueue(message, diagnostics);
   }
 
   acknowledge(sourceRobotId: number, sequence: number): boolean {
     return this.scheduler.acknowledge(sourceRobotId, sequence);
+  }
+
+  get hasPendingWrites(): boolean {
+    return this.scheduler.hasPendingWrites;
   }
 
   getHealth(now = Date.now()): RobotHealth {

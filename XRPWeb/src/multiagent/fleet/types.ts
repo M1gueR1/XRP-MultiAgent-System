@@ -1,6 +1,6 @@
 import type { RobotCapabilities } from "../protocol/capabilities";
 import type { MultiAgentMessage } from "../protocol/message";
-import type { RobotTransport } from "../transport/RobotTransport";
+import type { RobotTransport, RuntimeDataChannel, TransportWriteDiagnostics } from "../transport/RobotTransport";
 
 export type RobotSessionState =
   | "disconnected"
@@ -44,6 +44,8 @@ export interface RobotSessionSnapshot {
   alias: string;
   deviceName?: string;
   browserIdentity?: string;
+  runtimeChannel?: RuntimeDataChannel;
+  runtimeUartWithoutResponseSupported?: boolean;
   state: RobotSessionState;
   health: RobotHealth;
   capabilities?: RobotCapabilities;
@@ -62,7 +64,7 @@ export interface RobotSessionContract {
   readonly metrics: RobotSessionMetrics;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
-  send(message: MultiAgentMessage): Promise<void>;
+  send(message: MultiAgentMessage, diagnostics?: PingWriteDiagnostics): Promise<void>;
   nextSequence(): number;
 }
 
@@ -75,6 +77,33 @@ export interface RoutingLogEntry {
   sequence: number;
   status: string;
   rttMs?: number;
+}
+
+export interface PingWriteDiagnostics extends TransportWriteDiagnostics {
+  packetBytes?: number;
+  queueDepthAtEnqueue?: number;
+  schedulerQueueMs?: number;
+  transportCallMs?: number;
+  writeFinishedAt?: number;
+  activeWriteAtEnqueue?: string;
+  queuedWritesAtEnqueue?: string;
+  pendingAcksAtEnqueue?: number;
+  blockingWrites?: number;
+  blockingWriteMs?: number;
+  blockingMessageKinds?: string;
+  automaticPingsSkipped?: number;
+}
+
+export interface PingTestResult {
+  robotId: number;
+  sequence: number;
+  startedAt: number;
+  status: "received" | "timeout" | "error";
+  rttMs?: number;
+  detail?: string;
+  diagnostics?: PingWriteDiagnostics;
+  afterWriteMs?: number;
+  replyBeforeWriteCompleted?: boolean;
 }
 
 export type MessageQos = "latest" | "reliable" | "normal";

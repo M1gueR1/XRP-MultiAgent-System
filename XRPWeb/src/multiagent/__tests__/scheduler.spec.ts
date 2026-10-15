@@ -10,6 +10,7 @@ import {
 } from "../protocol/constants";
 import { decodeMultiAgentMessage, decodeXppPacket, type MultiAgentMessage } from "../protocol/message";
 import type { RobotTransport } from "../transport/RobotTransport";
+import type { PingWriteDiagnostics } from "../fleet/types";
 
 class ControlledTransport implements RobotTransport {
   connected = true;
@@ -41,6 +42,54 @@ function message(sequence: number, topicId: number, flags = 0, ttl = 1000): Mult
 }
 
 describe("per-session write scheduler", () => {
+  it("identifies active and queued blockers without changing probe priority", async () => {
+    const transport = new ControlledTransport();
+    transport.delayMs = 15;
+    const scheduler = new RobotWriteScheduler(transport, createSessionMetrics());
+    const heartbeat = scheduler.enqueue({ ...message(1, 0), messageKind: MultiAgentMessageKind.HEARTBEAT });
+    const directory = scheduler.enqueue(message(2, MultiAgentTopic.TEAM_DIRECTORY));
+    const diagnostics: PingWriteDiagnostics = { channel: "unknown" };
+    const probe = scheduler.enqueue({ ...message(3, 0), messageKind: MultiAgentMessageKind.PING }, diagnostics);
+    expect(scheduler.hasPendingWrites).toBe(true);
+    expect(diagnostics).toMatchObject({
+      activeWriteAtEnqueue: "HEARTBEAT", queuedWritesAtEnqueue: "DATA:TEAM_DIRECTORY", pendingAcksAtEnqueue: 0,
+    });
+    await Promise.all([heartbeat, directory, probe]);
+    expect(diagnostics.blockingWrites).toBe(2);
+    expect(diagnostics.blockingMessageKinds).toBe("HEARTBEAT|DATA:TEAM_DIRECTORY");
+    expect(diagnostics.blockingWriteMs).toBeGreaterThanOrEqual(15);
+    expect(diagnostics.blockingWriteMs).toBeLessThanOrEqual(diagnostics.schedulerQueueMs!);
+    expect(transport.writes.map((write) => write.sequence)).toEqual([1, 2, 3]);
+    expect(scheduler.hasPendingWrites).toBe(false);
+  });
+
+  it("distinguishes pending reliable ACKs from writes blocking a probe", async () => {
+    const transport = new ControlledTransport();
+    const scheduler = new RobotWriteScheduler(transport, createSessionMetrics());
+    const reliable = scheduler.enqueue(message(1, MultiAgentTopic.SYSTEM_TEST, MultiAgentFlag.ACK_REQUIRED));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(scheduler.hasPendingWrites).toBe(false);
+    const diagnostics: PingWriteDiagnostics = { channel: "unknown" };
+    await scheduler.enqueue(message(2, MultiAgentTopic.SYSTEM_TEST), diagnostics);
+    expect(diagnostics).toMatchObject({ pendingAcksAtEnqueue: 1, activeWriteAtEnqueue: "", blockingWrites: 0 });
+    expect(scheduler.acknowledge(LAPTOP_COORDINATOR_ID, 1)).toBe(true);
+    await reliable;
+  });
+
+  it("separates scheduler waiting from transport write time for a probe", async () => {
+    const transport = new ControlledTransport();
+    transport.delayMs = 20;
+    const scheduler = new RobotWriteScheduler(transport, createSessionMetrics());
+    const blocker = scheduler.enqueue(message(1, MultiAgentTopic.SYSTEM_TEST));
+    const diagnostics: PingWriteDiagnostics = { channel: "unknown" };
+    await scheduler.enqueue(message(2, MultiAgentTopic.SYSTEM_TEST), diagnostics);
+    await blocker;
+    expect(diagnostics.packetBytes).toBe(21);
+    expect(diagnostics.queueDepthAtEnqueue).toBeGreaterThanOrEqual(0);
+    expect(diagnostics.schedulerQueueMs).toBeGreaterThanOrEqual(10);
+    expect(diagnostics.transportCallMs).toBeGreaterThanOrEqual(10);
+    expect(diagnostics.writeFinishedAt).toBeDefined();
+  });
   it("coalesces latest-only messages and keeps queues bounded", async () => {
     const transport = new ControlledTransport();
     transport.delayMs = 10;
