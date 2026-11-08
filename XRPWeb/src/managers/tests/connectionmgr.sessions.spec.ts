@@ -1055,7 +1055,8 @@ describe('ConnectionMgr session-bound runs', () => {
         await prepare([bluetooth.sessionId]);
 
         expect(commands.uploadFileBatch).toHaveBeenCalledOnce();
-        expect(commands.uploadFileBatch.mock.calls[0][0]).toHaveLength(12);
+        // Includes the optional Python adapter added by the native-code prototype.
+        expect(commands.uploadFileBatch.mock.calls[0][0]).toHaveLength(13);
         expect(commands.uploadFile).not.toHaveBeenCalled();
         expect(bluetooth.multiAgentLibraryInstalled).toBe(true);
         expect(bluetooth.teamTransportConfigured).toBe(true);

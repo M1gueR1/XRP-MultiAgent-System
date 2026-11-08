@@ -20,6 +20,16 @@ type MutableBluetoothConnection = {
 };
 
 describe('BluetoothConnection write reliability', () => {
+    it('rejects the firmware restart marker in file text, binary data and paths before writing', () => {
+        const connection = new BluetoothConnection({} as ConnectionMgr, { autoReconnect: false });
+        const marker = '##XRP' + 'STOP##';
+        expect(() => connection.assertFileUploadSafe('/test.py', '# comment ' + marker)).toThrow('reserved restart marker');
+        const bytes = new TextEncoder().encode('x'.repeat(247) + marker + '\n');
+        expect(() => connection.assertFileUploadSafe('/test.py', bytes)).toThrow('reserved restart marker');
+        expect(() => connection.assertFileUploadSafe('/' + marker + '.py', 'print(1)')).toThrow('reserved restart marker');
+        expect(() => connection.assertFileUploadSafe('/test.py', '# firmware stop marker\nprint(1)')).not.toThrow();
+        expect(() => connection.assertFileUploadSafe('/test.py', 'print("##XRP" + "STOP##")')).not.toThrow();
+    });
     it('sends the unchanged 55-byte frame in one experimental UART write and keeps larger frames conservative', async () => {
         const withResponse = vi.fn(async () => undefined);
         const withoutResponse = vi.fn(async (_bytes: BufferSource) => undefined);

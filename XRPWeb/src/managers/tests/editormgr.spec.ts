@@ -1,10 +1,13 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import EditorMgr, { EditorSession } from '@/managers/editormgr';
 import { EditorType } from '@/utils/types';
 import { Model } from 'flexlayout-react';
 import { StorageKeys } from '@/utils/localstorage';
+import AppMgr, { EventType } from '@/managers/appmgr';
+import { CommandToXRPMgr } from '@/managers/commandstoxrpmgr';
 
 describe('EditorMgr', () => {
+    afterEach(() => vi.restoreAllMocks());
     let editorMgr: EditorMgr;
     let session: EditorSession;
 
@@ -21,6 +24,26 @@ describe('EditorMgr', () => {
             lastUpdated: undefined,
             isModified: false,
         };
+    });
+
+    it('keeps a rejected Bluetooth draft locally and shows an error before opening saving progress', async () => {
+        const emit = vi.fn();
+        const connection = { isConnected: () => true, assertFileUploadSafe: () => { throw new Error('reserved restart marker'); } };
+        vi.spyOn(AppMgr, 'getInstance').mockReturnValue({
+            getConnection: () => connection, authService: { isLogin: false }, emit,
+        } as unknown as AppMgr);
+        const upload = vi.spyOn(CommandToXRPMgr.prototype, 'uploadFile');
+        const manager = new EditorMgr();
+        manager.AddEditor(session);
+        const draft = '# ##XRP' + 'STOP##\nprint(1)';
+        await manager.saveEditor(session.id, draft);
+        expect(upload).not.toHaveBeenCalled();
+        expect(session.isModified).toBe(true);
+        expect(session.content).toBe(draft);
+        expect(emit).toHaveBeenCalledWith(EventType.EVENT_ALERT, 'reserved restart marker');
+        expect(emit).not.toHaveBeenCalledWith(EventType.EVENT_SHOWPROGRESS, expect.anything());
+        const saved = JSON.parse(localStorage.getItem(StorageKeys.EDITORSTORE) ?? '[]');
+        expect(saved.find((item: { id: string }) => item.id === session.id)).toMatchObject({ content: draft, isSavedToXRP: false });
     });
 
     it('should add a new editor session', () => {

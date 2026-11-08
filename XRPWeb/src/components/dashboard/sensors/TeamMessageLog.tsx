@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { FaChartLine, FaDownload, FaStop, FaTimes, FaTrash } from "react-icons/fa";
 import { saveAs } from "file-saver";
 import { BROADCAST_ROBOT_ID, runSingleRobotRttTest, type FleetSnapshot, type PingTestResult, type RobotFleetManager, type RuntimeDataChannel } from "@/multiagent";
+import SustainedRateTestPanel from "./SustainedRateTestPanel";
 
 type TestSample = {
   id: number;
@@ -159,8 +160,9 @@ export default function TeamMessageLog({ snapshot, fleet }: { snapshot: FleetSna
       <button type="button" className="rounded border border-[#fde047] bg-[#000000] px-3 py-1 font-bold text-[#fef9c3] hover:bg-[#fde047] hover:text-[#000000] disabled:opacity-50" disabled={running || ready.length === 0} onClick={() => {
         if (target !== String(BROADCAST_ROBOT_ID) && !ready.some((session) => String(session.robotId) === target)) setTarget(String(BROADCAST_ROBOT_ID));
         setShowTester(true);
-      }}>{running ? "Waiting for replies..." : "Test message"}</button>
+      }}>{running ? "Test running..." : "Test message"}</button>
       <button type="button" disabled={running || ready.length === 0} className="flex items-center gap-2 rounded border border-[#fde047] px-3 py-1 text-[#fef9c3] disabled:opacity-50" onClick={() => setShowDiagnostic(true)}><FaChartLine /> RTT diagnostic</button>
+      <SustainedRateTestPanel snapshot={snapshot} fleet={fleet} busy={running} onBusyChange={setRunning} />
       {seriesRunning && <><span className="text-mountain-mist-300">{seriesProgress.completed}/{seriesProgress.total}</span><button type="button" title="Stop RTT test" aria-label="Stop RTT test" className="rounded border border-cinnabar-300 p-2 text-cinnabar-300" onClick={() => testController.current?.abort()}><FaStop /></button></>}
     </div>
     {diagnosticError && <p role="alert" className="mb-2 break-words text-cinnabar-300">{diagnosticError}</p>}

@@ -6,6 +6,14 @@ import type { RobotTransport } from "../transport/RobotTransport";
 import { monotonicNow } from "./metrics";
 import type { PingWriteDiagnostics, RobotSessionMetrics } from "./types";
 
+/** The scheduler rejected this packet before invoking the transport. */
+export class MessageExpiredBeforeSendError extends Error {
+  constructor() {
+    super("Message expired before it could be sent.");
+    this.name = "MessageExpiredBeforeSendError";
+  }
+}
+
 interface ScheduledWrite {
   message: MultiAgentMessage;
   packet: Uint8Array;
@@ -178,7 +186,8 @@ export class RobotWriteScheduler {
         if (this.isStale(write)) {
           this.metrics.stalePackets += 1;
           this.metrics.messagesDropped += 1;
-          write.reject(new Error("Message expired before it could be sent."));
+          if (write.diagnostics) write.diagnostics.schedulerQueueMs = monotonicNow() - write.enqueuedAt;
+          write.reject(new MessageExpiredBeforeSendError());
           continue;
         }
         this.activeWrite = write;

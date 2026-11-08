@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createSessionMetrics } from "../fleet/metrics";
-import { RobotWriteScheduler } from "../fleet/writeScheduler";
+import { MessageExpiredBeforeSendError, RobotWriteScheduler } from "../fleet/writeScheduler";
 import {
   LAPTOP_COORDINATOR_ID,
   MultiAgentFlag,
@@ -42,6 +42,25 @@ function message(sequence: number, topicId: number, flags = 0, ttl = 1000): Mult
 }
 
 describe("per-session write scheduler", () => {
+  it("identifies deadline expiry before transport delivery and records queue waiting", async () => {
+    const transport = new ControlledTransport();
+    let release!: () => void;
+    transport.writeData = async (data) => {
+      transport.writes.push(decodeMultiAgentMessage(decodeXppPacket(data).payload));
+      await new Promise<void>((resolve) => { release = resolve; });
+    };
+    const metrics = createSessionMetrics();
+    const scheduler = new RobotWriteScheduler(transport, metrics);
+    const blocker = scheduler.enqueue(message(1, MultiAgentTopic.SYSTEM_TEST));
+    const diagnostics: PingWriteDiagnostics = { channel: "unknown" };
+    const expired = expect(scheduler.enqueue(message(2, 0x7f30, 0, 1), diagnostics)).rejects.toBeInstanceOf(MessageExpiredBeforeSendError);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    release();
+    await Promise.all([blocker, expired]);
+    expect(transport.writes.map((write) => write.sequence)).toEqual([1]);
+    expect(diagnostics.schedulerQueueMs).toBeGreaterThan(1);
+    expect(metrics.stalePackets).toBe(1);
+  });
   it("identifies active and queued blockers without changing probe priority", async () => {
     const transport = new ControlledTransport();
     transport.delayMs = 15;

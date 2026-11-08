@@ -28,13 +28,16 @@ class MultiAgentTransport:
     injection remains available for tests and future firmware.
     """
 
-    def __init__(self, writer=None, maximum_chunks=32):
+    def __init__(self, writer=None, maximum_chunks=32, maximum_stream_read_attempts=512):
+        if not isinstance(maximum_stream_read_attempts, int) or not 1 <= maximum_stream_read_attempts <= 512:
+            raise ValueError("stream read budget must be 1 to 512 bytes")
         self._writer = writer
         self._usb_reader = None
         self._usb_poller = None
         self._usb_text_buffer = ""
         self._chunks = []
         self._maximum_chunks = maximum_chunks
+        self._maximum_stream_read_attempts = maximum_stream_read_attempts
         self.dropped_chunks = 0
         self._attached = False
 
@@ -109,7 +112,7 @@ class MultiAgentTransport:
 
         received = []
         attempts = 0
-        while self._usb_poller.poll(0) and attempts < 512:
+        while attempts < self._maximum_stream_read_attempts and self._usb_poller.poll(0):
             attempts += 1
             try:
                 value = self._usb_reader.read(1)

@@ -42,6 +42,7 @@ class MultiAgentNode:
         maximum_pending_acks=16,
         acknowledgement_timeout_ms=500,
         maximum_retries=2,
+        codec_backend=None,
     ):
         identity_bytes = str(hardware_identity).encode("utf-8")
         if len(identity_bytes) > 32:
@@ -60,7 +61,8 @@ class MultiAgentNode:
         self.ready = False
         self._last_hello_ms = 0
         self._last_heartbeat_ms = 0
-        self._parser = XPPStreamParser()
+        self._codec_backend = codec_backend
+        self._parser = XPPStreamParser() if codec_backend is None else codec_backend.create_parser()
         self._received = []
         self._recent = []
         self._callbacks = {}
@@ -85,7 +87,8 @@ class MultiAgentNode:
                     message_type, payload = decode_xpp(packet)
                     if message_type != XPP_MULTI_AGENT:
                         continue
-                    message = decode_message(payload)
+                    message = (decode_message(payload) if self._codec_backend is None
+                               else self._codec_backend.decode_message(payload))
                     message.arrival_ms = ticks_ms()
                     self._handle_message(message)
                     processed += 1
@@ -241,7 +244,8 @@ class MultiAgentNode:
                 callback(message)
 
     def _write(self, message):
-        packet = encode_packet(message)
+        packet = (encode_packet(message) if self._codec_backend is None
+                  else self._codec_backend.encode_packet(message))
         self.transport.write(packet)
         self.diagnostics.messages_sent += 1
         self.diagnostics.bytes_sent += len(packet)

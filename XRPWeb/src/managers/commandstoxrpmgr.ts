@@ -738,6 +738,7 @@ export class CommandToXRPMgr {
             return true;
         }
 
+        this.connection?.assertFileUploadSafe?.(filePath, fileContents);
         const pathToFile = filePath.substring(0, filePath.lastIndexOf('/'));
         await this.ensureDirectory(pathToFile);
 
@@ -927,12 +928,10 @@ export class CommandToXRPMgr {
             path,
             bytes: typeof content === 'string' ? encoder.encode(content) : content,
         }));
+        for (const file of encodedFiles) connection.assertFileUploadSafe?.(file.path, file.bytes);
         const parentPaths = [...new Set(encodedFiles.map(({ path }) =>
             path.substring(0, path.lastIndexOf('/')),
         ))];
-        for (const parentPath of parentPaths) {
-            await this.ensureDirectory(parentPath);
-        }
 
         const totalByteLength = encodedFiles.reduce(
             (total, file) => total + file.bytes.length,
@@ -943,6 +942,12 @@ export class CommandToXRPMgr {
         for (const file of encodedFiles) {
             payload.set(file.bytes, payloadOffset);
             payloadOffset += file.bytes.length;
+        }
+        // Files are streamed consecutively, so a reserved marker can also span
+        // a file boundary even if neither file contains the complete sequence.
+        connection.assertFileUploadSafe?.('the file bundle', payload);
+        for (const parentPath of parentPaths) {
+            await this.ensureDirectory(parentPath);
         }
 
         const fileSpecs = encodedFiles

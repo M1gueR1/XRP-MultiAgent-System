@@ -4,6 +4,7 @@ import diagnostics from '../../../../XRP_MicroPython/MultiAgentLib/diagnostics.p
 import init from '../../../../XRP_MicroPython/MultiAgentLib/__init__.py?raw';
 import message from '../../../../XRP_MicroPython/MultiAgentLib/message.py?raw';
 import node from '../../../../XRP_MicroPython/MultiAgentLib/node.py?raw';
+import nativeCodec from '../../../../XRP_MicroPython/MultiAgentLib/native_codec.py?raw';
 import streamParser from '../../../../XRP_MicroPython/MultiAgentLib/stream_parser.py?raw';
 import team from '../../../../XRP_MicroPython/MultiAgentLib/team.py?raw';
 import topicRegistry from '../../../../XRP_MicroPython/MultiAgentLib/topic_registry.py?raw';
@@ -22,6 +23,7 @@ export const MULTI_AGENT_LIBRARY_FILES: ReadonlyArray<{
   { path: '/lib/MultiAgentLib/diagnostics.py', content: diagnostics },
   { path: '/lib/MultiAgentLib/topic_registry.py', content: topicRegistry },
   { path: '/lib/MultiAgentLib/node.py', content: node },
+  { path: '/lib/MultiAgentLib/native_codec.py', content: nativeCodec },
   { path: '/lib/MultiAgentLib/team.py', content: team },
 ];
 

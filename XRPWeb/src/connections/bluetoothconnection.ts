@@ -748,6 +748,23 @@ export class BluetoothConnection extends Connection {
         }
     }
 
+    public assertFileUploadSafe(filePath: string, content: string | Uint8Array): void {
+        let containsMarker = filePath.includes(this.BLE_STOP_MSG);
+        if (typeof content === 'string') {
+            containsMarker ||= content.includes(this.BLE_STOP_MSG);
+        } else {
+            // Inspect the complete payload, including matches spanning BLE chunks.
+            for (let offset = 0; !containsMarker && offset <= content.length - this.BLE_STOP_MSG.length; offset++) {
+                let index = 0;
+                while (index < this.BLE_STOP_MSG.length && content[offset + index] === this.BLE_STOP_MSG.charCodeAt(index)) index++;
+                containsMarker = index === this.BLE_STOP_MSG.length;
+            }
+        }
+        if (containsMarker) {
+            throw new Error(`Cannot upload ${filePath} over Bluetooth: it contains the firmware's reserved restart marker. Remove that literal sequence or upload through USB. The upload was blocked before opening the file.`);
+        }
+    }
+
     private async ensureREPLChannel(): Promise<void> {
         if (this.gattRecoveryPromise) await this.gattRecoveryPromise;
         if (this.isConnected() && this.bleWriter && this.bleDevice?.gatt?.connected !== false) return;

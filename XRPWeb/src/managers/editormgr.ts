@@ -370,6 +370,16 @@ export default class EditorMgr {
                     );
                     return;
                 }
+                // Validate before opening the saving dialog. Rejected drafts
+                // remain modified and available locally, without a stuck spinner.
+                try {
+                    AppMgr.getInstance().getConnection()?.assertFileUploadSafe?.(session.path, code);
+                } catch (error) {
+                    session.isModified = true;
+                    this.SaveToLocalStorage(session, code);
+                    AppMgr.getInstance().emit(EventType.EVENT_ALERT, error instanceof Error ? error.message : String(error));
+                    return;
+                }
                 // save the session to XRP
                 AppMgr.getInstance().emit(EventType.EVENT_SHOWPROGRESS, Constants.SHOW_PROGRESS);
                 await CommandToXRPMgr.getInstance().uploadFile(session.path, code, true).then(() =>{

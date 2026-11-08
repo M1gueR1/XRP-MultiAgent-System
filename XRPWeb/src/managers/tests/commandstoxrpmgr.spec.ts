@@ -11,6 +11,41 @@ function deferred<T>() {
 }
 
 describe('CommandToXRPMgr session isolation', () => {
+    it('validates a BLE file before creating directories or opening the remote file', async () => {
+        const connection = {
+            isConnected: () => true,
+            assertFileUploadSafe: vi.fn(() => { throw new Error('reserved restart marker'); }),
+            writeUtilityCmdRaw: vi.fn(), writeToDevice: vi.fn(),
+        } as unknown as Connection;
+        const commands = new CommandToXRPMgr(false);
+        commands.setConnection(connection);
+        const buildPath = vi.spyOn(commands, 'buildPath');
+        await expect(commands.uploadFile('/lib/test.py', '# ##XRP' + 'STOP##')).rejects.toThrow('reserved restart marker');
+        expect(buildPath).not.toHaveBeenCalled();
+        expect(connection.writeUtilityCmdRaw).not.toHaveBeenCalled();
+        expect(connection.writeToDevice).not.toHaveBeenCalled();
+        expect(commands.BUSY).toBe(false);
+    });
+
+    it('validates the concatenated bundle before writing, including a marker across file boundaries', async () => {
+        const connection = {
+            isConnected: () => true,
+            assertFileUploadSafe: vi.fn((_path: string, bytes: Uint8Array) => {
+                if (new TextDecoder().decode(bytes).includes('##XRP' + 'STOP##')) throw new Error('reserved restart marker');
+            }),
+            writeUtilityCmdRaw: vi.fn(), writeToDevice: vi.fn(),
+        } as unknown as Connection;
+        const commands = new CommandToXRPMgr(false);
+        commands.setConnection(connection);
+        const buildPath = vi.spyOn(commands, 'buildPath');
+        await expect(commands.uploadFileBatch([
+            { path: '/lib/a.py', content: '##XRP' }, { path: '/lib/b.py', content: 'STOP##' },
+        ])).rejects.toThrow('reserved restart marker');
+        expect(buildPath).not.toHaveBeenCalled();
+        expect(connection.writeUtilityCmdRaw).not.toHaveBeenCalled();
+        expect(connection.writeToDevice).not.toHaveBeenCalled();
+        expect(commands.BUSY).toBe(false);
+    });
     it('prepares a cold XRP REPL and always releases the busy lock', async () => {
         const connection = {
             isConnected: () => true,

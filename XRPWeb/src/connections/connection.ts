@@ -71,6 +71,9 @@ abstract class Connection {
     abstract disconnect(): Promise<void>;
     abstract isConnected(): boolean;
 
+    /** Validate file bytes before opening/truncating a remote file. USB has no reserved BLE marker. */
+    public assertFileUploadSafe(_filePath: string, _content: string | Uint8Array): void {}
+
     private _isNanoXRP: boolean = false;
 
     isNanoXRP(): boolean { return this._isNanoXRP; }
